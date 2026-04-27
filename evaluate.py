@@ -79,7 +79,7 @@ def prompt_rag(question: str, structured: dict) -> str:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--adapter", type=Path, required=True, help="path to trained LoRA adapter")
-    parser.add_argument("--structured", type=Path, required=True, help="path to structured.json")
+    parser.add_argument("--schema", type=Path, required=True, help="path to schema.json (saved by run.py)")
     parser.add_argument("--csv", type=Path, required=True, help="source CSV (same one used for training)")
     parser.add_argument("--column", default="transcription")
     parser.add_argument("--num-test", type=int, default=10)
@@ -98,17 +98,11 @@ def main():
     test_notes = test_df[args.column].tolist()
     print(f"📂 picked {len(test_notes)} test notes (seed={args.seed})")
 
-    # 2. Load structured forms (for RAG mode). Match each test note by string-prefix to a structured form
-    #    if available, else extract on-the-fly using base model. For first-pass: just use the
-    #    structured forms from training and pick the closest match by prefix. Cheap heuristic.
-    with open(args.structured) as f:
-        structured_pool = json.load(f)
-    structured_by_prefix = {item["original"][:100]: item["structured"] for item in structured_pool}
-
-    def find_structured(note: str) -> dict | None:
-        # Best-effort: same prefix → same structured form. Misses generalization
-        # but fine for sanity-check eval. Returns None if test note wasn't in training set.
-        return structured_by_prefix.get(note[:100])
+    # 2. Load schema (we'll extract structured forms for the test notes on the fly)
+    with open(args.schema) as f:
+        schema_payload = json.load(f)
+    schema = schema_payload["schema"]
+    domain = schema_payload.get("domain", "your domain")
 
     # 3. Load base + tokenizer
     print(f"🤖 loading {BASE_MODEL}...")
@@ -119,6 +113,22 @@ def main():
     base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, dtype=torch.bfloat16, device_map="auto")
     base.eval()
     print("✅ base model loaded")
+
+    # 4. Extract structured forms for the held-out test notes (used by RAG mode).
+    #    Same logic the pipeline used during training, just on different docs.
+    print("\n" + "=" * 60)
+    print("EXTRACTING structured forms for the 10 held-out test notes")
+    print("=" * 60)
+    from pipeline.extract import batch_extract_structured
+
+    structured_results, _ = batch_extract_structured(
+        base, tok, test_notes, domain, schema, batch_size=4,
+    )
+    structured_by_idx: dict[int, dict] = {item["id"]: item["structured"] for item in structured_results}
+    print(f"✅ {len(structured_by_idx)}/{len(test_notes)} extracted")
+
+    def find_structured(note_idx: int) -> dict | None:
+        return structured_by_idx.get(note_idx)
 
     # ── Mode 1: baseline (raw note → stock Qwen) ─────────────────────────
     print("\n" + "=" * 60)
@@ -138,10 +148,10 @@ def main():
     print("=" * 60)
     rag_answers = []
     for i, note in enumerate(test_notes):
-        structured = find_structured(note)
+        structured = find_structured(i)
         for q in QUESTIONS:
             if structured is None:
-                ans = "[skipped — no structured form available for this test note]"
+                ans = "[skipped — extraction failed for this test note]"
             else:
                 ans = generate(base, tok, prompt_rag(q, structured))
             rag_answers.append({"note_idx": i, "question": q, "answer": ans, "had_form": structured is not None})
