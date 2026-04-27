@@ -1,0 +1,7 @@
+output*/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+hf_cache/
