@@ -376,7 +376,7 @@ def task_qa(
     questions: list[str],
     domain: str,
     *,
-    questions_per_doc: int = 2,
+    questions_per_doc: int = 4,
     batch_size: int = 16,
 ) -> list[dict[str, str]]:
     """Teacher-generated: traditional Q&A pairs, sampled over reasoning questions only."""
@@ -411,6 +411,37 @@ def task_qa(
 
 
 # ── Top-level orchestrator ───────────────────────────────────────────────
+
+
+# Cap each task at this fraction of total docs to prevent summary/red_flags
+# from drowning out the rarer-but-important reasoning tasks (assessment,
+# continuation). Empirically determined: v3 had 63% summary+red_flags which
+# made the trained model behave like a summary writer instead of a clinician.
+MAX_PER_TASK_FRAC = 0.5  # cap any single task at 50% of #docs
+
+
+def _balance_curriculum(
+    rows: list[dict[str, str]], n_docs: int
+) -> list[dict[str, str]]:
+    """Cap any task that exceeds MAX_PER_TASK_FRAC * n_docs.
+
+    Random-sample down to the cap so the model gets a balanced curriculum.
+    Tasks below the cap are left untouched.
+    """
+    cap = max(int(n_docs * MAX_PER_TASK_FRAC), 50)
+    by_task: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for r in rows:
+        by_task[r["task"]].append(r)
+
+    balanced: list[dict[str, str]] = []
+    for task, task_rows in by_task.items():
+        if len(task_rows) > cap:
+            sampled = random.sample(task_rows, cap)
+            print(f"  balancing: {task} {len(task_rows)} → {cap}")
+            balanced.extend(sampled)
+        else:
+            balanced.extend(task_rows)
+    return balanced
 
 
 def generate_curriculum(
@@ -469,5 +500,9 @@ def generate_curriculum(
     _emit("8.qa", rows)
     all_rows.extend(rows)
 
-    print(f"\n✅ Curriculum total: {len(all_rows)} training examples across 8 tasks", flush=True)
+    print(f"\n✅ Curriculum raw: {len(all_rows)} examples across 8 tasks", flush=True)
+
+    # Balance — prevent any one task from dominating training
+    all_rows = _balance_curriculum(all_rows, n_docs=len(structured_items))
+    print(f"✅ Curriculum balanced: {len(all_rows)} training examples", flush=True)
     return all_rows
