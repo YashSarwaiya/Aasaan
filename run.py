@@ -35,7 +35,10 @@ import os
 import time
 from pathlib import Path
 
-from pipeline import curriculum, extract, llm, qa, schema, train
+from pipeline import (
+    curriculum, dedup, dpo, extract, llm, pii, qa,
+    quality, refine, schema, train,
+)
 
 
 def _eprint(*args, **kwargs):
@@ -123,7 +126,15 @@ def run_data_prep(
     if not docs:
         raise SystemExit("no documents loaded — check --input and --column")
 
-    _eprint("\n🤖 Loading Qwen 2.5 7B Instruct (extractor)...")
+    # ── Pre-pipeline data quality steps ──────────────────────────────
+    # Both are no-ops on missing optional deps (datasketch / presidio).
+    _eprint("\n=" * 60)
+    _eprint("STEP 0: 🧹 dedup + PII stripping")
+    _eprint("=" * 60)
+    docs, n_dropped_dups = dedup.deduplicate(docs, threshold=0.85)
+    docs, n_pii_redacted = pii.anonymize_documents(docs)
+
+    _eprint(f"\n🤖 Loading Qwen 2.5 7B Instruct (extractor)...")
     model, tokenizer = llm.load_model("Qwen/Qwen2.5-7B-Instruct")
     _eprint("✅ Extractor loaded\n")
 
@@ -224,10 +235,36 @@ def run_data_prep(
     )
     _eprint(f"✅ {len(grounded)} grounded examples after validation\n")
 
+    # ── 6.5. Multi-pass refinement (critique → rewrite) ────────────────
+    _eprint("=" * 60)
+    _eprint("STEP 6.5: ✨ multi-pass refinement (critique → rewrite)")
+    _eprint("=" * 60)
+    refined = refine.refine_pairs(teacher, teacher_tok, grounded)
+    n_refined = sum(1 for p in refined if p.get("refined"))
+    _eprint(f"✅ {len(refined)} refined ({n_refined} rewritten, "
+            f"{len(refined) - n_refined} kept as-is)\n")
+
+    # ── 6.7. Quality classifier (0-5 scoring, drop below 3) ────────────
+    _eprint("=" * 60)
+    _eprint("STEP 6.7: ⭐ quality scoring (0-5)")
+    _eprint("=" * 60)
+    scored = quality.score_quality(teacher, teacher_tok, refined)
+    high_quality, score_dist = quality.filter_by_quality(scored, min_score=3)
+    _eprint(f"✅ {len(high_quality)} high-quality pairs (≥3/5)\n")
+
+    # ── 6.8. DPO data generation (preference pairs) ────────────────────
+    _eprint("=" * 60)
+    _eprint("STEP 6.8: 🎯 DPO preference pair generation")
+    _eprint("=" * 60)
+    dpo_triples = dpo.generate_rejected_answers(teacher, teacher_tok, high_quality)
+    _eprint(f"✅ {len(dpo_triples)} DPO preference triples\n")
+
     with open(output_dir / "training_data_v2.json", "w") as f:
         json.dump(curriculum_data, f, indent=2)
     with open(output_dir / "training_data_clean.json", "w") as f:
-        json.dump(grounded, f, indent=2)
+        json.dump(high_quality, f, indent=2)
+    with open(output_dir / "training_data_dpo.json", "w") as f:
+        json.dump(dpo_triples, f, indent=2)
 
     # ── Free 32B before training (run_training reloads 7B) ───────────
     _eprint("🧹 Freeing 32B teacher from GPU...")
@@ -239,6 +276,8 @@ def run_data_prep(
     metadata = {
         "domain": domain,
         "num_input_docs": len(docs),
+        "dropped_duplicates": n_dropped_dups,
+        "pii_redacted_docs": n_pii_redacted,
         "schema_fields": len(sch),
         "lookup_fields": lookup_fields,
         "reasoning_fields": reasoning_fields,
@@ -248,13 +287,94 @@ def run_data_prep(
         "training_pairs": len(curriculum_data),  # alias for back-compat
         "after_surface_filter": len(surface_clean),
         "dropped_hallucination": dropped_hallu,
-        "clean_pairs": len(grounded),
+        "after_grounding": len(grounded),
+        "refined_pairs": n_refined,
+        "quality_score_distribution": score_dist,
+        "high_quality_pairs": len(high_quality),
+        "clean_pairs": len(high_quality),  # final training set
+        "dpo_triples": len(dpo_triples),
         "teacher_model": teacher_model_name,
         "data_prep_seconds": round(elapsed, 1),
     }
     with open(output_dir / "run_metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
     _eprint(f"⏱️  data prep took {elapsed/60:.1f} min")
+    return metadata
+
+
+def run_training_llamafactory(output_dir: Path, config_path: Path) -> dict:
+    """Phase 9 alternative: train via LLaMA-Factory CLI.
+
+    Replaces our hand-rolled trl/peft loop with LLaMA-Factory's optimized
+    training. Free wins: FlashAttention-2, NEFTune, better LR scheduling,
+    quantized training paths, less code to maintain.
+
+    Process:
+      1. Read training_data_clean.json from output_dir
+      2. Register dataset under LLaMA-Factory's data/dataset_info.json
+      3. Override output_dir in config to point at adapter/
+      4. subprocess.run llamafactory-cli train
+
+    The config (configs/lora.yaml) is the source of truth for all training
+    hyperparameters. We only override output paths.
+    """
+    import subprocess
+    import shutil
+
+    clean_path = output_dir / "training_data_clean.json"
+    if not clean_path.exists():
+        raise SystemExit(f"no training data at {clean_path}")
+
+    # Ensure llamafactory-cli is on PATH
+    if shutil.which("llamafactory-cli") is None:
+        raise SystemExit(
+            "llamafactory-cli not found. Install: pip install llamafactory"
+        )
+
+    # 1. Register dataset with LLaMA-Factory.
+    # Its data/dataset_info.json uses {dataset_name: {file_name, columns, ...}}.
+    # We point it at our training_data_clean.json (alpaca format already).
+    lf_data_dir = output_dir / "lf_data"
+    lf_data_dir.mkdir(exist_ok=True)
+    shutil.copy(clean_path, lf_data_dir / "aasaan_curriculum.json")
+    dataset_info = {
+        "aasaan_curriculum": {
+            "file_name": "aasaan_curriculum.json",
+            "columns": {
+                "prompt": "instruction",
+                "query": "input",
+                "response": "output",
+            },
+        }
+    }
+    (lf_data_dir / "dataset_info.json").write_text(json.dumps(dataset_info, indent=2))
+
+    # 2. Build CLI command with output_dir + dataset_dir overrides.
+    adapter_dir = output_dir / "adapter"
+    cmd = [
+        "llamafactory-cli", "train", str(config_path),
+        f"output_dir={adapter_dir}",
+        f"dataset_dir={lf_data_dir}",
+    ]
+    _eprint(f"🚀 Running: {' '.join(cmd)}")
+
+    started = time.time()
+    proc = subprocess.run(cmd, check=False)
+    elapsed = time.time() - started
+
+    if proc.returncode != 0:
+        raise SystemExit(f"llamafactory-cli failed with exit code {proc.returncode}")
+
+    _eprint(f"✅ LLaMA-Factory training done in {elapsed/60:.1f} min")
+    _eprint(f"📁 Adapter at {adapter_dir}")
+
+    # Update metadata
+    meta_path = output_dir / "run_metadata.json"
+    metadata = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    metadata["training_seconds"] = round(elapsed, 1)
+    metadata["training_backend"] = "llamafactory"
+    metadata["training_config"] = str(config_path)
+    meta_path.write_text(json.dumps(metadata, indent=2))
     return metadata
 
 
@@ -336,6 +456,18 @@ def main():
     parser.add_argument("--extract-batch-size", type=int, default=8)
     parser.add_argument("--qa-batch-size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument(
+        "--use-llamafactory",
+        action="store_true",
+        help="train via LLaMA-Factory CLI (uses configs/lora.yaml). "
+             "Adds FlashAttention-2, NEFTune, GaLore optimizations.",
+    )
+    parser.add_argument(
+        "--lf-config",
+        type=Path,
+        default=Path("configs/lora.yaml"),
+        help="LLaMA-Factory training config (only used with --use-llamafactory)",
+    )
 
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -357,7 +489,10 @@ def main():
     args = parser.parse_args()
 
     if args.train_only:
-        run_training(args.output, args.epochs)
+        if args.use_llamafactory:
+            run_training_llamafactory(args.output, args.lf_config)
+        else:
+            run_training(args.output, args.epochs)
         return
 
     if not args.input:
@@ -373,7 +508,10 @@ def main():
     )
 
     if args.train:
-        run_training(args.output, args.epochs)
+        if args.use_llamafactory:
+            run_training_llamafactory(args.output, args.lf_config)
+        else:
+            run_training(args.output, args.epochs)
 
     _eprint("\n🎉 Done.")
     _eprint(f"📁 {args.output}")

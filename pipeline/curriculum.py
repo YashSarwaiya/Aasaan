@@ -351,6 +351,197 @@ def task_summary(
     return rows
 
 
+# ── Task 9: PARAPHRASE — note → paraphrased note in clinical style ───────
+
+
+def make_paraphrase_prompt(note: str) -> str:
+    return f"""Rephrase this clinical note in your own words. Keep all medical
+facts identical (same drugs, doses, dates, symptoms, findings). Use
+different sentence structures and synonyms. Maintain clinical tone.
+
+Original:
+{note[:2000]}
+
+Paraphrased:"""
+
+
+def task_paraphrase(
+    teacher_model, teacher_tok, items: list[dict[str, Any]],
+    *, batch_size: int = 8, max_examples: int = 200,
+) -> list[dict[str, str]]:
+    """Generate paraphrased versions for paraphrase-detection training.
+
+    Output shape: each row is "Note A is paraphrase of Note B (yes/no)".
+    Trains the model to recognize equivalent clinical content.
+    """
+    sample = items[:max_examples]
+    prompts = [make_paraphrase_prompt(item["original"]) for item in sample]
+
+    rows: list[dict[str, str]] = []
+    for start in range(0, len(prompts), batch_size):
+        batch_items = sample[start:start + batch_size]
+        batch_prompts = prompts[start:start + batch_size]
+        outputs = batch_ask(teacher_model, teacher_tok, batch_prompts, max_tokens=400)
+        for item, out in zip(batch_items, outputs):
+            if len(out.strip()) < 100:
+                continue
+            rows.append({
+                "task": "paraphrase",
+                "instruction": "Rewrite this clinical note in your own words while keeping all facts identical.",
+                "input": item["original"][:2500],
+                "output": out.strip()[:1500],
+            })
+    return rows
+
+
+# ── Task 10: YES/NO — bounded clinical questions ────────────────────────
+
+
+YES_NO_GEN_PROMPT = """You are creating training data. Given this clinical note,
+write 2 yes/no questions a clinician might ask, with their correct answers.
+Questions must have unambiguous yes/no answers grounded in the note.
+
+Note:
+{note}
+
+Output as exactly 2 lines, each in this format:
+Q: <question> | A: <Yes or No>
+
+Lines:"""
+
+
+def task_yes_no(
+    teacher_model, teacher_tok, items: list[dict[str, Any]],
+    *, batch_size: int = 8,
+) -> list[dict[str, str]]:
+    """Generate yes/no Q&A pairs grounded in each note."""
+    prompts = [
+        YES_NO_GEN_PROMPT.format(note=item["original"][:1800])
+        for item in items
+    ]
+
+    rows: list[dict[str, str]] = []
+    for start in range(0, len(prompts), batch_size):
+        batch_items = items[start:start + batch_size]
+        batch_prompts = prompts[start:start + batch_size]
+        outputs = batch_ask(teacher_model, teacher_tok, batch_prompts, max_tokens=200)
+        for item, out in zip(batch_items, outputs):
+            # Parse the "Q: ... | A: Yes" lines
+            for line in out.split("\n"):
+                line = line.strip()
+                if "|" not in line:
+                    continue
+                q_part, _, a_part = line.partition("|")
+                q = q_part.replace("Q:", "").strip()
+                a = a_part.replace("A:", "").strip()
+                if not q or a.lower() not in ("yes", "no"):
+                    continue
+                rows.append({
+                    "task": "yes_no",
+                    "instruction": q[:200],
+                    "input": item["original"][:2500],
+                    "output": a.capitalize(),
+                })
+    return rows
+
+
+# ── Task 11: FACT EXTRACTION — find specific facts in note ──────────────
+
+
+FACT_EXTRACTION_PROMPT = """Extract a single specific clinical fact from this note.
+Output the fact as a complete sentence using the note's actual values.
+
+Categories to extract from (pick whichever applies):
+- A specific medication with dose
+- A specific lab value with units
+- A specific procedure performed
+- A specific finding from physical exam
+
+Note:
+{note}
+
+Single fact:"""
+
+
+def task_fact_extraction(
+    teacher_model, teacher_tok, items: list[dict[str, Any]],
+    *, batch_size: int = 8,
+) -> list[dict[str, str]]:
+    """Generate (note → single specific fact) training pairs."""
+    prompts = [FACT_EXTRACTION_PROMPT.format(note=item["original"][:1800]) for item in items]
+
+    rows: list[dict[str, str]] = []
+    for start in range(0, len(prompts), batch_size):
+        batch_items = items[start:start + batch_size]
+        batch_prompts = prompts[start:start + batch_size]
+        outputs = batch_ask(teacher_model, teacher_tok, batch_prompts, max_tokens=120)
+        for item, out in zip(batch_items, outputs):
+            if len(out.strip()) < 15:
+                continue
+            rows.append({
+                "task": "fact_extraction",
+                "instruction": "Extract one specific medical fact from this note.",
+                "input": item["original"][:2500],
+                "output": out.strip()[:300],
+            })
+    return rows
+
+
+# ── Task 12: CORRECTION — train to say "I don't know" with confidence ──
+
+
+CORRECTION_PROMPT = """Generate ONE question that CANNOT be answered from this clinical note
+(asks for info that's clearly not in the document — e.g. "what's the patient's
+favorite color", "what time was the surgery scheduled" if no time is given,
+"what insurance does the patient have" if not stated).
+
+Note:
+{note}
+
+Output exactly:
+Q: <unanswerable question>"""
+
+
+def task_correction(
+    teacher_model, teacher_tok, items: list[dict[str, Any]],
+    *, batch_size: int = 8, max_examples: int = 150,
+) -> list[dict[str, str]]:
+    """Generate "I don't know" training pairs.
+
+    Trains the model to confidently refuse questions whose answers aren't
+    in the source. Reduces hallucination by teaching the bound of knowledge.
+    """
+    sample = items[:max_examples]
+    prompts = [CORRECTION_PROMPT.format(note=item["original"][:1800]) for item in sample]
+
+    rows: list[dict[str, str]] = []
+    canned_refusals = [
+        "Not specified in the document.",
+        "The note does not provide this information.",
+        "This is not stated in the source material.",
+    ]
+    rng_idx = 0
+    for start in range(0, len(prompts), batch_size):
+        batch_items = sample[start:start + batch_size]
+        batch_prompts = prompts[start:start + batch_size]
+        outputs = batch_ask(teacher_model, teacher_tok, batch_prompts, max_tokens=80)
+        for item, out in zip(batch_items, outputs):
+            # Extract the question from "Q: ..."
+            q_text = out.replace("Q:", "").strip()
+            q_text = q_text.split("\n")[0].strip()
+            if not q_text or len(q_text) < 10:
+                continue
+            answer = canned_refusals[rng_idx % len(canned_refusals)]
+            rng_idx += 1
+            rows.append({
+                "task": "correction",
+                "instruction": q_text[:200],
+                "input": item["original"][:2500],
+                "output": answer,
+            })
+    return rows
+
+
 # ── Task 8: Q&A — structured form + question → answer ────────────────────
 # Uses the same skip-empty + has_content_for_question helpers as the legacy
 # qa.py path, but only over REASONING-classified questions so we don't burn
@@ -500,7 +691,24 @@ def generate_curriculum(
     _emit("8.qa", rows)
     all_rows.extend(rows)
 
-    print(f"\n✅ Curriculum raw: {len(all_rows)} examples across 8 tasks", flush=True)
+    # Tasks 9-12: extra task types (paraphrase, yes/no, fact extraction, correction)
+    rows = task_paraphrase(teacher_model, teacher_tok, structured_items)
+    _emit("9.paraphrase", rows)
+    all_rows.extend(rows)
+
+    rows = task_yes_no(teacher_model, teacher_tok, structured_items)
+    _emit("10.yes_no", rows)
+    all_rows.extend(rows)
+
+    rows = task_fact_extraction(teacher_model, teacher_tok, structured_items)
+    _emit("11.fact_extraction", rows)
+    all_rows.extend(rows)
+
+    rows = task_correction(teacher_model, teacher_tok, structured_items)
+    _emit("12.correction", rows)
+    all_rows.extend(rows)
+
+    print(f"\n✅ Curriculum raw: {len(all_rows)} examples across 12 tasks", flush=True)
 
     # Balance — prevent any one task from dominating training
     all_rows = _balance_curriculum(all_rows, n_docs=len(structured_items))

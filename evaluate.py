@@ -173,6 +173,38 @@ def main():
             trained_answers.append({"note_idx": i, "question": q, "answer": ans})
         print(f"  {i + 1}/{len(test_notes)}")
 
+    # ── Mode 4: trained + RAG (the real hybrid) ──────────────────────────
+    # Builds an in-memory RAG index over the structured forms of test notes
+    # (just the lookup-style fields) and queries with the trained model.
+    # This is the mode that should win the hybrid claim.
+    print("\n" + "=" * 60)
+    print("MODE 4: trained + RAG (LoRA + retrieval over structured forms)")
+    print("=" * 60)
+    try:
+        from pipeline.rag import build_rag_index, rag_answer
+
+        rag_items = [
+            {"id": item["id"], "structured": item["structured"]}
+            for item in structured_results
+        ]
+        # Index lookup-style fields if schema_payload provides them, else all
+        index_fields = schema_payload.get("lookup_fields") or None
+        rag_handle = build_rag_index(rag_items, fields=index_fields)
+        print(f"✅ RAG index: {rag_handle.get('n_chunks', 0)} chunks "
+              f"(backend={rag_handle.get('_backend')})")
+
+        trained_rag_answers = []
+        for i, note in enumerate(test_notes):
+            for q in QUESTIONS:
+                ans = rag_answer(rag_handle, q, trained, tok, top_k=5)
+                trained_rag_answers.append({
+                    "note_idx": i, "question": q, "answer": ans
+                })
+            print(f"  {i + 1}/{len(test_notes)}")
+    except Exception as e:
+        print(f"⚠️ trained+RAG mode failed: {e}")
+        trained_rag_answers = []
+
     # ── Save ──────────────────────────────────────────────────────────────
     results = {
         "test_notes": [{"idx": i, "preview": n[:300]} for i, n in enumerate(test_notes)],
@@ -180,6 +212,7 @@ def main():
         "baseline": baseline_answers,
         "rag": rag_answers,
         "trained": trained_answers,
+        "trained_rag": trained_rag_answers,
     }
     args.output.write_text(json.dumps(results, indent=2))
     print(f"\n📁 wrote {args.output}")
