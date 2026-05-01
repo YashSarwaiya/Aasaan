@@ -207,3 +207,91 @@ def filter_clean(training_data: list[dict[str, str]]) -> list[dict[str, str]]:
 
         filtered.append(d)
     return filtered
+
+
+# ── Grounding validator (Qwen 32B as judge) ──────────────────────────────
+
+
+GROUNDING_PROMPT = """You are a strict but fair clinical fact checker.
+
+Given the source clinical note and an answer the AI produced, score whether the answer is GROUNDED in the note.
+
+=== RUBRIC ===
+1 = every fact in the answer is in the note (or correctly states the info is missing)
+0 = the answer contains made-up facts, hallucinated drugs/dates/conditions, or contradicts the note
+
+A confident "no medications" answer when the note says "PERTINENT MEDICATION: None" is GROUNDED (1).
+An answer that mentions a drug name not in the note is HALLUCINATED (0).
+An answer with placeholder text like "mm/dd/yyyy" is HALLUCINATED (0).
+An answer that adds clinical reasoning consistent with the note's facts is GROUNDED (1).
+An answer that invents specific numbers, dates, or names not in the note is HALLUCINATED (0).
+
+=== CASE ===
+NOTE:
+{note}
+
+INSTRUCTION: {instruction}
+ANSWER: {answer}
+
+Apply the rubric. Respond with ONLY a single character: 1 or 0
+Score:"""
+
+
+def _parse_score(response: str) -> int:
+    """Extract first 0/1 from judge output. Default to 1 (keep) on parse failure
+    so we don't drop pairs because of formatting glitches in the judge."""
+    import re
+    m = re.search(r"[01]", response)
+    return int(m.group()) if m else 1
+
+
+def validate_grounded(
+    judge_model,
+    judge_tok,
+    training_data: list[dict[str, str]],
+    *,
+    batch_size: int = 8,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> tuple[list[dict[str, str]], int]:
+    """Validate every training pair against its source note using a teacher LLM.
+
+    Same pattern as `judge.py` (the eval scorer). Returns (kept_pairs, dropped_count).
+    The judge model should be Qwen 32B — generates calls expensive but only
+    ~4 max-tokens per call so it's fast.
+
+    SAFETY: parse failures default to KEEP (1), so a malformed judge response
+    can't accidentally wipe out training data.
+    """
+    if not training_data:
+        return [], 0
+
+    prompts = [
+        GROUNDING_PROMPT.format(
+            note=d["input"][:2000],
+            instruction=d["instruction"],
+            answer=d["output"][:600],
+        )
+        for d in training_data
+    ]
+
+    kept: list[dict[str, str]] = []
+    dropped = 0
+    total = len(training_data)
+    for start in range(0, total, batch_size):
+        batch_data = training_data[start:start + batch_size]
+        batch_prompts = prompts[start:start + batch_size]
+        responses = batch_ask(judge_model, judge_tok, batch_prompts, max_tokens=4)
+        for d, resp in zip(batch_data, responses):
+            score = _parse_score(resp)
+            if score == 1:
+                kept.append(d)
+            else:
+                dropped += 1
+        if on_progress is not None:
+            on_progress(min(start + batch_size, total), total)
+
+    print(
+        f"  validated {total} pairs → kept {len(kept)}, dropped {dropped} hallucinated",
+        flush=True,
+    )
+    return kept, dropped

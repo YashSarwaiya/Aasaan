@@ -30,6 +30,33 @@ def load_model(model_name: str = "Qwen/Qwen2.5-7B-Instruct"):
     return model, tokenizer
 
 
+def load_teacher(model_name: str = "Qwen/Qwen2.5-32B-Instruct"):
+    """Load the bigger teacher model used by the multi-task curriculum and
+    the grounding validator.
+
+    Same loading pattern as load_model — Qwen 32B fits comfortably on a
+    single B200 (~64GB / 180GB). Used for distillation: the 32B teacher
+    generates higher-quality training data than the 7B student could
+    produce on its own.
+    """
+    return load_model(model_name)
+
+
+def unload_model(model) -> None:
+    """Free GPU memory before loading a different model.
+
+    Call this between teacher → student swaps in the pipeline. Without it
+    the next load_model() can OOM because PyTorch holds onto the previous
+    weights' memory until garbage collection runs.
+    """
+    import gc
+
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def ask(model, tokenizer, prompt: str, max_tokens: int = 500) -> str:
     """Single-prompt LLM call. Mirrors universal_pipeline.py:ask()."""
     messages = [{"role": "user", "content": prompt}]

@@ -35,7 +35,7 @@ import os
 import time
 from pathlib import Path
 
-from pipeline import extract, llm, qa, schema, train
+from pipeline import curriculum, extract, llm, qa, schema, train
 
 
 def _eprint(*args, **kwargs):
@@ -103,10 +103,18 @@ def run_data_prep(
     num: int,
     extract_batch_size: int,
     qa_batch_size: int,
+    teacher_model_name: str = "Qwen/Qwen2.5-32B-Instruct",
 ) -> dict:
-    """Phases 1-8: load → domain → schema → questions → extract → Q&A → filter.
+    """Multi-phase pipeline: load → domain → schema (with field split) → extract
+    → multi-task curriculum (Qwen 32B teacher) → grounded validation (same 32B)
+    → final clean training set.
 
     Saves all artifacts under output_dir. Returns metadata about the run.
+
+    Two model loads:
+      1. Qwen 7B for domain/schema/extraction (steps 1-4)
+      2. Qwen 32B for curriculum + validation (steps 5-6)
+      Then 7B reloaded for training in run_training().
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
@@ -115,9 +123,9 @@ def run_data_prep(
     if not docs:
         raise SystemExit("no documents loaded — check --input and --column")
 
-    _eprint("\n🤖 Loading Qwen 2.5 7B Instruct...")
+    _eprint("\n🤖 Loading Qwen 2.5 7B Instruct (extractor)...")
     model, tokenizer = llm.load_model("Qwen/Qwen2.5-7B-Instruct")
-    _eprint("✅ Model loaded\n")
+    _eprint("✅ Extractor loaded\n")
 
     # ── 1. Detect domain ─────────────────────────────────────────────
     _eprint("=" * 60)
@@ -127,14 +135,26 @@ def run_data_prep(
     _eprint(f"✅ {domain}\n")
     (output_dir / "domain.txt").write_text(domain)
 
-    # ── 2. Build schema ──────────────────────────────────────────────
+    # ── 2. Build schema + classify lookup vs reasoning ───────────────
     _eprint("=" * 60)
-    _eprint("STEP 2: 📋 building schema")
+    _eprint("STEP 2: 📋 building schema + classifying fields")
     _eprint("=" * 60)
     sch = schema.build_schema(model, tokenizer, domain, docs)
-    _eprint(f"✅ {len(sch)} fields\n{json.dumps(sch, indent=2)[:600]}\n")
+    lookup_fields, reasoning_fields = schema.classify_fields(sch)
+    _eprint(f"✅ {len(sch)} fields total")
+    _eprint(f"   lookup ({len(lookup_fields)}, RAG-served): {lookup_fields}")
+    _eprint(f"   reasoning ({len(reasoning_fields)}, train target): {reasoning_fields}\n")
     with open(output_dir / "schema.json", "w") as f:
-        json.dump({"domain": domain, "schema": sch}, f, indent=2)
+        json.dump(
+            {
+                "domain": domain,
+                "schema": sch,
+                "lookup_fields": lookup_fields,
+                "reasoning_fields": reasoning_fields,
+            },
+            f,
+            indent=2,
+        )
 
     # ── 3. Generate questions ────────────────────────────────────────
     _eprint("=" * 60)
@@ -170,51 +190,71 @@ def run_data_prep(
     with open(output_dir / "structured.json", "w") as f:
         json.dump(structured, f, indent=2)
 
-    # ── 5. Generate Q&A ──────────────────────────────────────────────
-    _eprint("=" * 60)
-    _eprint("STEP 5: 🧠 generating training Q&A")
-    _eprint("=" * 60)
+    # ── Free Qwen 7B before loading the 32B teacher ──────────────────
+    _eprint("🧹 Freeing 7B from GPU before loading 32B teacher...")
+    llm.unload_model(model)
+    del tokenizer
+    _eprint("✅ Memory cleared\n")
 
-    def on_qa(done: int, total: int):
-        if done % (qa_batch_size * 4) == 0:
-            _eprint(f"  ...{done}/{total}")
+    # ── 5. Multi-task curriculum (Qwen 32B teacher) ──────────────────
+    _eprint("=" * 60)
+    _eprint(f"STEP 5: 🎓 multi-task curriculum (teacher = {teacher_model_name})")
+    _eprint("=" * 60)
+    _eprint(f"🤖 Loading teacher {teacher_model_name}...")
+    teacher, teacher_tok = llm.load_teacher(teacher_model_name)
+    _eprint("✅ Teacher loaded\n")
 
-    training_data = qa.generate_qa(
-        model,
-        tokenizer,
-        structured,
-        questions,
-        domain,
-        batch_size=qa_batch_size,
-        on_progress=on_qa,
+    curriculum_data = curriculum.generate_curriculum(
+        teacher, teacher_tok, structured, questions, domain
     )
-    _eprint(f"✅ {len(training_data)} Q&A pairs\n")
-    with open(output_dir / "training_data_v2.json", "w") as f:
-        json.dump(training_data, f, indent=2)
+    _eprint(f"✅ {len(curriculum_data)} curriculum examples (8 tasks)\n")
+    with open(output_dir / "curriculum_data.json", "w") as f:
+        json.dump(curriculum_data, f, indent=2)
 
-    # ── 6. Filter clean ──────────────────────────────────────────────
+    # ── 6. Surface filter (refusals/placeholders) + grounding validation ──
     _eprint("=" * 60)
-    _eprint("STEP 6: 🧹 filtering noisy rows")
+    _eprint("STEP 6: 🧹 surface filter + grounding validation (32B judge)")
     _eprint("=" * 60)
-    clean = qa.filter_clean(training_data)
-    _eprint(f"✅ {len(clean)} clean (dropped {len(training_data) - len(clean)})\n")
+
+    surface_clean = qa.filter_clean(curriculum_data)
+    _eprint(f"  surface filter: {len(surface_clean)} kept (dropped {len(curriculum_data) - len(surface_clean)})")
+
+    grounded, dropped_hallu = qa.validate_grounded(
+        teacher, teacher_tok, surface_clean
+    )
+    _eprint(f"✅ {len(grounded)} grounded examples after validation\n")
+
+    with open(output_dir / "training_data_v2.json", "w") as f:
+        json.dump(curriculum_data, f, indent=2)
     with open(output_dir / "training_data_clean.json", "w") as f:
-        json.dump(clean, f, indent=2)
+        json.dump(grounded, f, indent=2)
+
+    # ── Free 32B before training (run_training reloads 7B) ───────────
+    _eprint("🧹 Freeing 32B teacher from GPU...")
+    llm.unload_model(teacher)
+    del teacher_tok
+    _eprint("✅ Memory cleared\n")
 
     elapsed = time.time() - started
     metadata = {
         "domain": domain,
         "num_input_docs": len(docs),
         "schema_fields": len(sch),
+        "lookup_fields": lookup_fields,
+        "reasoning_fields": reasoning_fields,
         "structured_count": len(structured),
         "extraction_failed": failed,
-        "training_pairs": len(training_data),
-        "clean_pairs": len(clean),
+        "curriculum_pairs": len(curriculum_data),
+        "training_pairs": len(curriculum_data),  # alias for back-compat
+        "after_surface_filter": len(surface_clean),
+        "dropped_hallucination": dropped_hallu,
+        "clean_pairs": len(grounded),
+        "teacher_model": teacher_model_name,
         "data_prep_seconds": round(elapsed, 1),
     }
     with open(output_dir / "run_metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
-    _eprint(f"⏱️  data prep took {elapsed:.0f}s")
+    _eprint(f"⏱️  data prep took {elapsed/60:.1f} min")
     return metadata
 
 
