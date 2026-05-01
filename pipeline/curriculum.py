@@ -643,6 +643,7 @@ def generate_curriculum(
     domain: str,
     *,
     on_progress: Callable[[str, int, int], None] | None = None,
+    include_new_tasks: bool = True,
 ) -> list[dict[str, str]]:
     """Run all 8 tasks and return the combined training set.
 
@@ -691,24 +692,28 @@ def generate_curriculum(
     _emit("8.qa", rows)
     all_rows.extend(rows)
 
-    # Tasks 9-12: extra task types (paraphrase, yes/no, fact extraction, correction)
-    rows = task_paraphrase(teacher_model, teacher_tok, structured_items)
-    _emit("9.paraphrase", rows)
-    all_rows.extend(rows)
+    # Tasks 9-12: optional new task types (paraphrase, yes/no, fact_extraction, correction)
+    if include_new_tasks:
+        rows = task_paraphrase(teacher_model, teacher_tok, structured_items)
+        _emit("9.paraphrase", rows)
+        all_rows.extend(rows)
 
-    rows = task_yes_no(teacher_model, teacher_tok, structured_items)
-    _emit("10.yes_no", rows)
-    all_rows.extend(rows)
+        rows = task_yes_no(teacher_model, teacher_tok, structured_items)
+        _emit("10.yes_no", rows)
+        all_rows.extend(rows)
 
-    rows = task_fact_extraction(teacher_model, teacher_tok, structured_items)
-    _emit("11.fact_extraction", rows)
-    all_rows.extend(rows)
+        rows = task_fact_extraction(teacher_model, teacher_tok, structured_items)
+        _emit("11.fact_extraction", rows)
+        all_rows.extend(rows)
 
-    rows = task_correction(teacher_model, teacher_tok, structured_items)
-    _emit("12.correction", rows)
-    all_rows.extend(rows)
+        rows = task_correction(teacher_model, teacher_tok, structured_items)
+        _emit("12.correction", rows)
+        all_rows.extend(rows)
+        n_tasks = 12
+    else:
+        n_tasks = 8
 
-    print(f"\n✅ Curriculum raw: {len(all_rows)} examples across 12 tasks", flush=True)
+    print(f"\n✅ Curriculum raw: {len(all_rows)} examples across {n_tasks} tasks", flush=True)
 
     # Balance — prevent any one task from dominating training
     all_rows = _balance_curriculum(all_rows, n_docs=len(structured_items))

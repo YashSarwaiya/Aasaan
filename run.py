@@ -107,6 +107,11 @@ def run_data_prep(
     extract_batch_size: int,
     qa_batch_size: int,
     teacher_model_name: str = "Qwen/Qwen2.5-32B-Instruct",
+    *,
+    skip_refine: bool = False,
+    skip_quality_filter: bool = False,
+    skip_new_tasks: bool = False,
+    skip_dpo: bool = False,
 ) -> dict:
     """Multi-phase pipeline: load → domain → schema (with field split) → extract
     → multi-task curriculum (Qwen 32B teacher) → grounded validation (same 32B)
@@ -216,7 +221,8 @@ def run_data_prep(
     _eprint("✅ Teacher loaded\n")
 
     curriculum_data = curriculum.generate_curriculum(
-        teacher, teacher_tok, structured, questions, domain
+        teacher, teacher_tok, structured, questions, domain,
+        include_new_tasks=not skip_new_tasks,
     )
     _eprint(f"✅ {len(curriculum_data)} curriculum examples (8 tasks)\n")
     with open(output_dir / "curriculum_data.json", "w") as f:
@@ -235,29 +241,42 @@ def run_data_prep(
     )
     _eprint(f"✅ {len(grounded)} grounded examples after validation\n")
 
-    # ── 6.5. Multi-pass refinement (critique → rewrite) ────────────────
-    _eprint("=" * 60)
-    _eprint("STEP 6.5: ✨ multi-pass refinement (critique → rewrite)")
-    _eprint("=" * 60)
-    refined = refine.refine_pairs(teacher, teacher_tok, grounded)
-    n_refined = sum(1 for p in refined if p.get("refined"))
-    _eprint(f"✅ {len(refined)} refined ({n_refined} rewritten, "
-            f"{len(refined) - n_refined} kept as-is)\n")
+    # ── 6.5. Multi-pass refinement (critique → rewrite) — OPTIONAL ─────
+    if skip_refine:
+        _eprint("⏭️  STEP 6.5: skip_refine=True → using grounded directly")
+        refined = grounded
+        n_refined = 0
+    else:
+        _eprint("=" * 60)
+        _eprint("STEP 6.5: ✨ multi-pass refinement (critique → rewrite)")
+        _eprint("=" * 60)
+        refined = refine.refine_pairs(teacher, teacher_tok, grounded)
+        n_refined = sum(1 for p in refined if p.get("refined"))
+        _eprint(f"✅ {len(refined)} refined ({n_refined} rewritten)\n")
 
-    # ── 6.7. Quality classifier (0-5 scoring, drop below 3) ────────────
-    _eprint("=" * 60)
-    _eprint("STEP 6.7: ⭐ quality scoring (0-5)")
-    _eprint("=" * 60)
-    scored = quality.score_quality(teacher, teacher_tok, refined)
-    high_quality, score_dist = quality.filter_by_quality(scored, min_score=3)
-    _eprint(f"✅ {len(high_quality)} high-quality pairs (≥3/5)\n")
+    # ── 6.7. Quality classifier — OPTIONAL ─────────────────────────────
+    if skip_quality_filter:
+        _eprint("⏭️  STEP 6.7: skip_quality_filter=True → keeping all refined")
+        high_quality = refined
+        score_dist = {}
+    else:
+        _eprint("=" * 60)
+        _eprint("STEP 6.7: ⭐ quality scoring (0-5)")
+        _eprint("=" * 60)
+        scored = quality.score_quality(teacher, teacher_tok, refined)
+        high_quality, score_dist = quality.filter_by_quality(scored, min_score=3)
+        _eprint(f"✅ {len(high_quality)} high-quality pairs (≥3/5)\n")
 
-    # ── 6.8. DPO data generation (preference pairs) ────────────────────
-    _eprint("=" * 60)
-    _eprint("STEP 6.8: 🎯 DPO preference pair generation")
-    _eprint("=" * 60)
-    dpo_triples = dpo.generate_rejected_answers(teacher, teacher_tok, high_quality)
-    _eprint(f"✅ {len(dpo_triples)} DPO preference triples\n")
+    # ── 6.8. DPO data generation — OPTIONAL ────────────────────────────
+    if skip_dpo:
+        _eprint("⏭️  STEP 6.8: skip_dpo=True")
+        dpo_triples = []
+    else:
+        _eprint("=" * 60)
+        _eprint("STEP 6.8: 🎯 DPO preference pair generation")
+        _eprint("=" * 60)
+        dpo_triples = dpo.generate_rejected_answers(teacher, teacher_tok, high_quality)
+        _eprint(f"✅ {len(dpo_triples)} DPO preference triples\n")
 
     with open(output_dir / "training_data_v2.json", "w") as f:
         json.dump(curriculum_data, f, indent=2)
@@ -462,6 +481,16 @@ def main():
         help="train via LLaMA-Factory CLI (uses configs/lora.yaml). "
              "Adds FlashAttention-2, NEFTune, GaLore optimizations.",
     )
+    parser.add_argument("--skip-refine", action="store_true",
+                        help="skip multi-pass critique→rewrite refinement")
+    parser.add_argument("--skip-quality-filter", action="store_true",
+                        help="skip 0-5 quality scoring filter")
+    parser.add_argument("--skip-new-tasks", action="store_true",
+                        help="use only 8 original tasks (no paraphrase/yes_no/fact/correction)")
+    parser.add_argument("--skip-dpo", action="store_true",
+                        help="skip DPO preference pair generation")
+    parser.add_argument("--v3-mode", action="store_true",
+                        help="shortcut: enables --skip-refine --skip-quality-filter --skip-new-tasks --skip-dpo (= original v3 behavior)")
     parser.add_argument(
         "--lf-config",
         type=Path,
@@ -488,6 +517,13 @@ def main():
 
     args = parser.parse_args()
 
+    # --v3-mode shortcut → enables all skip flags
+    if args.v3_mode:
+        args.skip_refine = True
+        args.skip_quality_filter = True
+        args.skip_new_tasks = True
+        args.skip_dpo = True
+
     if args.train_only:
         if args.use_llamafactory:
             run_training_llamafactory(args.output, args.lf_config)
@@ -505,6 +541,10 @@ def main():
         num=args.num,
         extract_batch_size=args.extract_batch_size,
         qa_batch_size=args.qa_batch_size,
+        skip_refine=args.skip_refine,
+        skip_quality_filter=args.skip_quality_filter,
+        skip_new_tasks=args.skip_new_tasks,
+        skip_dpo=args.skip_dpo,
     )
 
     if args.train:
