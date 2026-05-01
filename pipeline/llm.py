@@ -30,16 +30,59 @@ def load_model(model_name: str = "Qwen/Qwen2.5-7B-Instruct"):
     return model, tokenizer
 
 
-def load_teacher(model_name: str = "Qwen/Qwen2.5-32B-Instruct"):
+def load_teacher(
+    model_name: str = "Qwen/Qwen2.5-32B-Instruct",
+    *,
+    quantize_4bit: bool | None = None,
+):
     """Load the bigger teacher model used by the multi-task curriculum and
     the grounding validator.
 
-    Same loading pattern as load_model — Qwen 32B fits comfortably on a
-    single B200 (~64GB / 180GB). Used for distillation: the 32B teacher
-    generates higher-quality training data than the 7B student could
-    produce on its own.
+    Auto-detects whether 4-bit quantization is needed: if the GPU has < 60 GB
+    free, falls back to bnb 4-bit (Qwen 32B at 4-bit ≈ 16 GB, fits on a 22 GB
+    L4). On B200 (180 GB) it loads in bf16 for full quality.
+
+    `quantize_4bit=True/False` lets the caller force a mode for testing.
     """
-    return load_model(model_name)
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    if quantize_4bit is None:
+        # Auto-decide based on GPU memory
+        if torch.cuda.is_available():
+            gpu_total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            quantize_4bit = gpu_total_gb < 60
+        else:
+            quantize_4bit = False
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+    if quantize_4bit:
+        from transformers import BitsAndBytesConfig
+
+        print(f"Loading {model_name} in 4-bit (small GPU detected)", flush=True)
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+        )
+    else:
+        print(f"Loading {model_name} in bf16 (large GPU)", flush=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=torch.bfloat16,
+            device_map="auto",
+        )
+    model.eval()
+    return model, tokenizer
 
 
 def unload_model(model) -> None:
