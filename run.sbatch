@@ -34,7 +34,7 @@ NUM="${3:-250}"
 
 OUTDIR="./output_$(date +%Y%m%d_%H%M%S)"
 
-ARGS=(--input "$INPUT" --num "$NUM" --output "$OUTDIR" --train)
+ARGS=(--input "$INPUT" --num "$NUM" --output "$OUTDIR" --train --v3-mode)
 if [[ -n "$COLUMN" ]]; then
   ARGS+=(--column "$COLUMN")
 fi
