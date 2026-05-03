@@ -312,27 +312,40 @@ def task_refuse(
 # ── Balancer + orchestrator ──────────────────────────────────────────────
 
 
-# Cap any single task at this fraction of n_docs to prevent dominance.
-# Empirical: in v3 medical, removing the cap let summary+red_flags drown
-# out the rarer tasks and the model learned to write summaries instead of
-# extract structured info.
-MAX_PER_TASK_FRAC = 0.5
+# Balancing was needed for medical (summary+red_flags drowned out rarer
+# tasks). For narrow extraction domains (logs, structured data), balancing
+# HURTS — it dilutes the dominant task (extract), which is the skill we
+# actually need. So we cap only at extreme dominance (>80% of total) and
+# only kick in when n_tasks > 1.
+MAX_PER_TASK_FRAC = 0.8  # only cap if a task is >80% of total volume
 
 
 def _balance_curriculum(
     rows: list[dict[str, str]], n_docs: int
 ) -> list[dict[str, str]]:
-    """Cap each task at MAX_PER_TASK_FRAC * n_docs (with a 50-row floor)."""
-    cap = max(int(n_docs * MAX_PER_TASK_FRAC), 50)
+    """Cap any task that exceeds MAX_PER_TASK_FRAC of total examples.
+
+    Conservative — only kicks in when one task overwhelmingly dominates.
+    Otherwise leaves the natural distribution alone, which preserves the
+    dominant skill for narrow domains.
+    """
+    if not rows:
+        return rows
     by_task: dict[str, list[dict[str, str]]] = defaultdict(list)
     for r in rows:
         by_task[r["task"]].append(r)
+
+    if len(by_task) <= 1:
+        return rows  # nothing to balance against
+
+    total = len(rows)
+    cap = int(total * MAX_PER_TASK_FRAC)
 
     balanced: list[dict[str, str]] = []
     for task, task_rows in by_task.items():
         if len(task_rows) > cap:
             sampled = random.sample(task_rows, cap)
-            print(f"  balancing: {task} {len(task_rows)} → {cap}", flush=True)
+            print(f"  balancing: {task} {len(task_rows)} → {cap} (>80% dominance)", flush=True)
             balanced.extend(sampled)
         else:
             balanced.extend(task_rows)

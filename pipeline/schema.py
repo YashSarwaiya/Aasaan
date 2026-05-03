@@ -111,13 +111,26 @@ Output ONLY the domain name in 2-5 words.
 Examples: "medical clinical notes", "legal contracts", "sales call logs", "software bug reports"
 Domain:"""
     raw = ask(model, tokenizer, prompt, max_tokens=60).strip()
-    # Strip common verbose preambles Llama tends to add ("Based on the content
-    # of the documents:", "The domain is:", quotes, etc.) and grab the last
-    # non-empty meaningful line.
-    cleaned = raw.replace("Based on the content of the documents:", "").strip()
-    cleaned = cleaned.replace("The domain is", "").strip(": \"'\n\t.")
-    lines = [l.strip(": \"'\n\t.") for l in cleaned.splitlines() if l.strip()]
-    return (lines[-1] if lines else "general documents")[:80]
+    # Strip Llama's verbose preambles, label prefixes, quotes, etc.
+    cleaned = raw
+    for preamble in (
+        "Based on the content of the documents:",
+        "Based on the content:",
+        "The domain is",
+        "Domain:",
+        "domain:",
+        "Industry:",
+        "industry:",
+    ):
+        cleaned = cleaned.replace(preamble, "")
+    cleaned = cleaned.strip()
+    # Take the last non-empty line (Llama sometimes lists alternatives)
+    # and strip wrapping punctuation/quotes from it.
+    lines = [l.strip().strip(": \"'\n\t.,;") for l in cleaned.splitlines() if l.strip()]
+    if not lines:
+        return "general documents"
+    result = lines[-1].strip(": \"'\n\t.,;").strip()
+    return result[:80] if result else "general documents"
 
 
 # Fallback schema — used only when both LLM attempts produce malformed JSON.
@@ -202,24 +215,17 @@ ONLY JSON, nothing else:"""
 def generate_questions(
     model, tokenizer, domain: str, schema: dict[str, str]
 ) -> list[str]:
-    """Step 3: ask for 10 useful questions over the schema. Falls back to per-field templates."""
-    prompt = f"""Domain: {domain}
-Available fields: {list(schema.keys())}
+    """Step 3: produce 10 questions tied to actual schema fields.
 
-Generate exactly 10 useful questions a user would ask about documents in this domain.
-
-Output ONLY a JSON list of 10 question strings, nothing else.
-Example: ["What is the diagnosis?", "List the medications.", ...]
-
-JSON list:"""
-    response = ask(model, tokenizer, prompt, max_tokens=600)
-    questions = extract_json_list(response)
-    if not questions or len(questions) < 5:
-        questions = [
-            f"What is the {field.replace('_', ' ')}?"
-            for field in list(schema.keys())[:10]
-        ]
-    return [str(q) for q in questions[:10]]
+    Previously asked an LLM to invent questions, but that produced abstract
+    schema-meta questions ("What are the available data types?") that didn't
+    match document content and trained the model to hallucinate. Field-based
+    questions are concrete and align with extraction.
+    """
+    return [
+        f"What is the {field.replace('_', ' ')}?"
+        for field in list(schema.keys())[:10]
+    ]
 
 
 def schema_to_typed(schema: dict[str, str]) -> list[dict[str, Any]]:
