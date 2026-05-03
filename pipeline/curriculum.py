@@ -1,563 +1,123 @@
-"""Multi-task training curriculum.
+"""Universal multi-task training curriculum.
 
-Replaces the single Q&A generation step with 8 different training tasks. Each
-task teaches a different clinical skill, so the resulting LoRA learns to
-*reason* about notes rather than just answer the same 10 question phrasings.
+Six task SHAPES that work on any domain — medical, legal, logs, support
+tickets, sales notes, code, anything. None of these tasks hardcode field
+names or domain language; the auto-detected `domain` string is plugged into
+each instruction at generation time.
 
-Tasks:
-  1. STRUCTURE       — raw note → structured form (JSON)
-  2. CONTINUATION    — note up to "PLAN:" → the plan
-  3. ASSESSMENT      — note minus assessment → assessment text
-  4. DIFFERENTIAL    — symptoms + history → differential diagnosis
-  5. RED_FLAGS       — full note → critical concerns
-  6. PATTERN         — N similar notes → common pattern
-  7. SUMMARY         — clinical note → plain-English summary
-  8. QA              — structured form + question → direct answer
+Task shapes:
+  1. EXTRACT     — raw text → structured JSON (uses whatever schema we built)
+  2. SUMMARIZE   — text → 1-3 sentences (skips very short docs)
+  3. QA          — text + question → answer
+  4. PARAPHRASE  — text → same content, different words
+  5. YES_NO      — text + binary question → Yes/No
+  6. REFUSE      — unanswerable question + text → "Not in the document"
 
-Tasks 1-3 are self-generating (text manipulation on existing extracted data,
-no LLM calls). Tasks 4-8 use the teacher (Llama 70B) to produce the output.
+Tasks 2-6 use the teacher LLM. Task 1 is self-generating from the structured
+extraction we already did.
 
-Each row is shaped like {instruction, input, output, task} ready for SFT.
-The `task` field is for analysis only — `train.py` ignores it.
+Each row: {instruction, input, output, task} — Alpaca format ready for SFT.
 """
 
 from __future__ import annotations
 
 import json
 import random
-import re
 from collections import defaultdict
 from typing import Any, Callable
 
 from .llm import batch_ask
-from .qa import EMPTY_VALUES, has_content_for_question, is_empty_value
+from .qa import has_content_for_question, is_empty_value
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
-# Section headers we look for to split a clinical note into pieces.
-# Order matters — we try longer/more-specific markers before generic ones.
-PLAN_MARKERS = (
-    "PLAN:", "Plan:", "TREATMENT PLAN:", "Treatment Plan:",
-    "Treatment plan:", "RECOMMENDATIONS:", "Recommendations:",
-)
-ASSESSMENT_MARKERS = (
-    "ASSESSMENT:", "Assessment:",
-    "IMPRESSION:", "Impression:",
-    "ASSESSMENT AND PLAN:", "Assessment and Plan:",
-)
+def _short_doc(text: str, min_chars: int = 200) -> bool:
+    """Skip tasks that don't make sense on very short inputs (e.g. 1-line logs)."""
+    return len(text) < min_chars
 
 
-def _split_on_marker(note: str, markers: tuple[str, ...]) -> tuple[str, str] | None:
-    """Split note at the first matching marker. Returns (before, after) or None."""
-    for marker in markers:
-        idx = note.find(marker)
-        if idx >= 0:
-            before = note[:idx].rstrip()
-            after = note[idx + len(marker):].lstrip()
-            if len(before) > 100 and len(after) > 30:
-                return before, after
-    return None
+# ── Task 1: EXTRACT — raw text → structured JSON ─────────────────────────
 
 
-def _structured_subset(structured: dict[str, Any], fields: list[str]) -> dict[str, Any]:
-    """Return only the fields in `fields` that have non-empty content."""
-    return {
-        f: structured[f]
-        for f in fields
-        if f in structured and not is_empty_value(structured[f])
-    }
+def task_extract(items: list[dict[str, Any]], domain: str) -> list[dict[str, str]]:
+    """Self-generating: input = raw text, output = the structured form we already pulled.
 
-
-# ── Task 1: STRUCTURE — raw note → structured form ───────────────────────
-
-
-def task_structure(items: list[dict[str, Any]]) -> list[dict[str, str]]:
-    """Self-generating: input = raw note, output = structured form (already extracted)."""
+    No LLM calls — we already paid that cost during extraction. This is the
+    cheapest, most universally-useful task.
+    """
     rows: list[dict[str, str]] = []
+    instruction = f"Extract the structured fields from this {domain} document as JSON."
     for item in items:
         if is_empty_value(item.get("structured")):
             continue
         rows.append({
-            "task": "structure",
-            "instruction": "Extract the structured clinical form from this note. Output JSON.",
+            "task": "extract",
+            "instruction": instruction,
             "input": item["original"][:2500],
             "output": json.dumps(item["structured"], indent=2)[:1500],
         })
     return rows
 
 
-# ── Task 2: CONTINUATION — partial note → plan ───────────────────────────
+# ── Task 2: SUMMARIZE — text → short summary ─────────────────────────────
 
 
-def task_continuation(items: list[dict[str, Any]]) -> list[dict[str, str]]:
-    """Self-generating: split at PLAN: marker, train model to write the plan."""
-    rows: list[dict[str, str]] = []
-    for item in items:
-        split = _split_on_marker(item["original"], PLAN_MARKERS)
-        if split is None:
-            continue
-        before, plan = split
-        rows.append({
-            "task": "continuation",
-            "instruction": "Continue this clinical note. Write the PLAN section.",
-            "input": before[-2000:],
-            "output": plan[:600],
-        })
-    return rows
+def make_summary_prompt(domain: str, text: str) -> str:
+    return f"""Summarize this {domain} document in 2-3 sentences. Keep all key
+facts intact. No embellishment, no preamble — just the summary.
+
+Document:
+{text[:2500]}
+
+Summary:"""
 
 
-# ── Task 3: ASSESSMENT — note minus assessment → assessment ──────────────
-
-
-def task_assessment_extraction(items: list[dict[str, Any]]) -> list[dict[str, str]]:
-    """Self-generating: extract the ASSESSMENT/IMPRESSION section as ground truth."""
-    rows: list[dict[str, str]] = []
-    for item in items:
-        split = _split_on_marker(item["original"], ASSESSMENT_MARKERS)
-        if split is None:
-            continue
-        before, assessment_block = split
-        # Trim assessment to first paragraph or 600 chars (whichever is shorter)
-        assessment = assessment_block.split("\n\n")[0][:600]
-        if len(assessment) < 30:
-            continue
-        rows.append({
-            "task": "assessment",
-            "instruction": "Write the clinical ASSESSMENT for this case based on the history and exam.",
-            "input": before[-2000:],
-            "output": assessment,
-        })
-    return rows
-
-
-# ── Task 4: DIFFERENTIAL — symptoms → differential diagnosis ─────────────
-
-
-def make_differential_prompt(structured: dict[str, Any]) -> str:
-    """Teacher prompt: given symptoms + history, generate a differential."""
-    relevant_keys = (
-        "chief_complaint", "history_of_present_illness",
-        "past_medical_history", "physical_examination",
-        "vitals", "laboratory_data",
-    )
-    context = _structured_subset(structured, list(relevant_keys))
-    return f"""You are a senior clinician.
-
-Patient information:
-{json.dumps(context, indent=2)[:1500]}
-
-List 3-5 possible diagnoses for this patient, ordered by likelihood. For each, give a 1-sentence reasoning.
-
-Output as a numbered list. Do NOT include a final answer or definitive diagnosis — this is the differential.
-
-Differential diagnosis:"""
-
-
-def task_differential(
-    teacher_model, teacher_tok, items: list[dict[str, Any]],
+def task_summarize(
+    teacher_model, teacher_tok, items: list[dict[str, Any]], domain: str,
     *, batch_size: int = 8,
 ) -> list[dict[str, str]]:
-    """Teacher-generated: input = symptoms+history, output = differential list."""
-    pairs: list[tuple[dict[str, Any], str]] = []
-    for item in items:
-        s = item.get("structured", {})
-        if is_empty_value(s.get("chief_complaint")) and is_empty_value(s.get("history_of_present_illness")):
-            continue
-        pairs.append((item, make_differential_prompt(s)))
-
-    rows: list[dict[str, str]] = []
-    for start in range(0, len(pairs), batch_size):
-        batch = pairs[start:start + batch_size]
-        prompts = [p[1] for p in batch]
-        outputs = batch_ask(teacher_model, teacher_tok, prompts, max_tokens=350)
-        for (item, _), out in zip(batch, outputs):
-            if len(out.strip()) < 30:
-                continue
-            rows.append({
-                "task": "differential",
-                "instruction": "List the most likely differential diagnoses for this patient with brief reasoning.",
-                "input": item["original"][:2500],
-                "output": out.strip()[:800],
-            })
-    return rows
-
-
-# ── Task 5: RED_FLAGS — full note → critical concerns ────────────────────
-
-
-def make_red_flags_prompt(note: str) -> str:
-    return f"""You are a senior clinician reviewing this case for safety concerns.
-
-CLINICAL NOTE:
-{note[:2500]}
-
-Identify ANY red flags — symptoms, lab values, history items, or vital signs that warrant urgent attention or escalation.
-
-If there are no red flags, say so explicitly.
-
-Output as a short bullet list (3-6 items). Be specific and grounded in the note — do NOT invent concerns that aren't supported.
-
-Red flags:"""
-
-
-def task_red_flags(
-    teacher_model, teacher_tok, items: list[dict[str, Any]],
-    *, batch_size: int = 8,
-) -> list[dict[str, str]]:
-    """Teacher-generated: input = full note, output = red flags list."""
-    pairs: list[tuple[dict[str, Any], str]] = []
-    for item in items:
-        if len(item.get("original", "")) < 200:
-            continue
-        pairs.append((item, make_red_flags_prompt(item["original"])))
-
-    rows: list[dict[str, str]] = []
-    for start in range(0, len(pairs), batch_size):
-        batch = pairs[start:start + batch_size]
-        prompts = [p[1] for p in batch]
-        outputs = batch_ask(teacher_model, teacher_tok, prompts, max_tokens=300)
-        for (item, _), out in zip(batch, outputs):
-            if len(out.strip()) < 30:
-                continue
-            rows.append({
-                "task": "red_flags",
-                "instruction": "Identify red flags or critical concerns in this clinical case.",
-                "input": item["original"][:2500],
-                "output": out.strip()[:600],
-            })
-    return rows
-
-
-# ── Task 6: PATTERN — N similar notes → common pattern ───────────────────
-
-
-def _cluster_by_complaint(items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Group notes by primary complaint keywords. Simple but effective."""
-    clusters: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for item in items:
-        s = item.get("structured", {})
-        cc = s.get("chief_complaint") or s.get("history_of_present_illness") or ""
-        if isinstance(cc, list):
-            cc = " ".join(str(x) for x in cc)
-        if not isinstance(cc, str) or len(cc) < 10:
-            continue
-        # First 3 meaningful words as cluster key
-        words = re.findall(r"\b[a-z]{4,}\b", cc.lower())
-        if len(words) < 2:
-            continue
-        key = " ".join(words[:3])
-        clusters[key].append(item)
-    # Keep only clusters with 3+ similar cases
-    return {k: v for k, v in clusters.items() if len(v) >= 3}
-
-
-def make_pattern_prompt(notes: list[str]) -> str:
-    blob = "\n\n=== CASE SEPARATOR ===\n\n".join(n[:1200] for n in notes[:5])
-    return f"""You are reviewing similar cases from one practice.
-
-CASES (notes from multiple patients with similar presenting complaints):
-{blob}
-
-Identify the COMMON PATTERN across these cases:
-- Typical presenting symptoms
-- Common workup or tests ordered
-- Usual treatment approach
-- Typical disposition / follow-up
-
-Be specific to what these cases actually show. 3-5 bullet points. Do not generalize beyond the cases.
-
-Common pattern:"""
-
-
-def task_pattern(
-    teacher_model, teacher_tok, items: list[dict[str, Any]],
-    *, max_clusters: int = 200, batch_size: int = 4,
-) -> list[dict[str, str]]:
-    """Teacher-generated: cluster similar notes, ask teacher for the common pattern.
-
-    Lower batch_size because input has 5 notes × ~1200 chars = larger context.
-    """
-    clusters = _cluster_by_complaint(items)
-    cluster_list = list(clusters.values())[:max_clusters]
-    if not cluster_list:
+    """Teacher-generated. Skips very short docs (logs, single-line errors)."""
+    candidates = [it for it in items if not _short_doc(it.get("original", ""))]
+    if not candidates:
         return []
 
-    pairs: list[tuple[list[dict[str, Any]], str]] = []
-    for cluster in cluster_list:
-        sample = random.sample(cluster, min(5, len(cluster)))
-        notes = [c["original"] for c in sample]
-        pairs.append((sample, make_pattern_prompt(notes)))
+    prompts = [make_summary_prompt(domain, it["original"]) for it in candidates]
+    instruction = f"Summarize this {domain} document in 2-3 sentences."
 
     rows: list[dict[str, str]] = []
-    for start in range(0, len(pairs), batch_size):
-        batch = pairs[start:start + batch_size]
-        prompts = [p[1] for p in batch]
-        outputs = batch_ask(teacher_model, teacher_tok, prompts, max_tokens=400)
-        for (sample, _), out in zip(batch, outputs):
-            if len(out.strip()) < 50:
-                continue
-            # Use the FIRST note as the input — model learns to recognize the
-            # pattern from any one note that fits the cluster.
-            rows.append({
-                "task": "pattern",
-                "instruction": "What is the common clinical pattern for cases like this in this practice?",
-                "input": sample[0]["original"][:2500],
-                "output": out.strip()[:700],
-            })
-    return rows
-
-
-# ── Task 7: SUMMARY — clinical note → plain-English summary ──────────────
-
-
-def make_summary_prompt(note: str) -> str:
-    return f"""Translate this clinical note into plain English a patient could understand.
-
-CLINICAL NOTE:
-{note[:2500]}
-
-Write 3-5 sentences. No medical jargon — explain conditions, medications, and next steps in everyday language. Keep all key facts intact.
-
-Plain English summary:"""
-
-
-def task_summary(
-    teacher_model, teacher_tok, items: list[dict[str, Any]],
-    *, batch_size: int = 8,
-) -> list[dict[str, str]]:
-    """Teacher-generated: input = clinical note, output = plain English."""
-    pairs: list[tuple[dict[str, Any], str]] = []
-    for item in items:
-        if len(item.get("original", "")) < 200:
-            continue
-        pairs.append((item, make_summary_prompt(item["original"])))
-
-    rows: list[dict[str, str]] = []
-    for start in range(0, len(pairs), batch_size):
-        batch = pairs[start:start + batch_size]
-        prompts = [p[1] for p in batch]
-        outputs = batch_ask(teacher_model, teacher_tok, prompts, max_tokens=300)
-        for (item, _), out in zip(batch, outputs):
+    for start in range(0, len(prompts), batch_size):
+        batch_items = candidates[start:start + batch_size]
+        batch_prompts = prompts[start:start + batch_size]
+        outputs = batch_ask(teacher_model, teacher_tok, batch_prompts, max_tokens=300)
+        for item, out in zip(batch_items, outputs):
             if len(out.strip()) < 50:
                 continue
             rows.append({
-                "task": "summary",
-                "instruction": "Summarize this clinical case in plain English a patient could understand.",
+                "task": "summarize",
+                "instruction": instruction,
                 "input": item["original"][:2500],
                 "output": out.strip()[:600],
             })
     return rows
 
 
-# ── Task 9: PARAPHRASE — note → paraphrased note in clinical style ───────
-
-
-def make_paraphrase_prompt(note: str) -> str:
-    return f"""Rephrase this clinical note in your own words. Keep all medical
-facts identical (same drugs, doses, dates, symptoms, findings). Use
-different sentence structures and synonyms. Maintain clinical tone.
-
-Original:
-{note[:2000]}
-
-Paraphrased:"""
-
-
-def task_paraphrase(
-    teacher_model, teacher_tok, items: list[dict[str, Any]],
-    *, batch_size: int = 8, max_examples: int = 200,
-) -> list[dict[str, str]]:
-    """Generate paraphrased versions for paraphrase-detection training.
-
-    Output shape: each row is "Note A is paraphrase of Note B (yes/no)".
-    Trains the model to recognize equivalent clinical content.
-    """
-    sample = items[:max_examples]
-    prompts = [make_paraphrase_prompt(item["original"]) for item in sample]
-
-    rows: list[dict[str, str]] = []
-    for start in range(0, len(prompts), batch_size):
-        batch_items = sample[start:start + batch_size]
-        batch_prompts = prompts[start:start + batch_size]
-        outputs = batch_ask(teacher_model, teacher_tok, batch_prompts, max_tokens=400)
-        for item, out in zip(batch_items, outputs):
-            if len(out.strip()) < 100:
-                continue
-            rows.append({
-                "task": "paraphrase",
-                "instruction": "Rewrite this clinical note in your own words while keeping all facts identical.",
-                "input": item["original"][:2500],
-                "output": out.strip()[:1500],
-            })
-    return rows
-
-
-# ── Task 10: YES/NO — bounded clinical questions ────────────────────────
-
-
-YES_NO_GEN_PROMPT = """You are creating training data. Given this clinical note,
-write 2 yes/no questions a clinician might ask, with their correct answers.
-Questions must have unambiguous yes/no answers grounded in the note.
-
-Note:
-{note}
-
-Output as exactly 2 lines, each in this format:
-Q: <question> | A: <Yes or No>
-
-Lines:"""
-
-
-def task_yes_no(
-    teacher_model, teacher_tok, items: list[dict[str, Any]],
-    *, batch_size: int = 8,
-) -> list[dict[str, str]]:
-    """Generate yes/no Q&A pairs grounded in each note."""
-    prompts = [
-        YES_NO_GEN_PROMPT.format(note=item["original"][:1800])
-        for item in items
-    ]
-
-    rows: list[dict[str, str]] = []
-    for start in range(0, len(prompts), batch_size):
-        batch_items = items[start:start + batch_size]
-        batch_prompts = prompts[start:start + batch_size]
-        outputs = batch_ask(teacher_model, teacher_tok, batch_prompts, max_tokens=200)
-        for item, out in zip(batch_items, outputs):
-            # Parse the "Q: ... | A: Yes" lines
-            for line in out.split("\n"):
-                line = line.strip()
-                if "|" not in line:
-                    continue
-                q_part, _, a_part = line.partition("|")
-                q = q_part.replace("Q:", "").strip()
-                a = a_part.replace("A:", "").strip()
-                if not q or a.lower() not in ("yes", "no"):
-                    continue
-                rows.append({
-                    "task": "yes_no",
-                    "instruction": q[:200],
-                    "input": item["original"][:2500],
-                    "output": a.capitalize(),
-                })
-    return rows
-
-
-# ── Task 11: FACT EXTRACTION — find specific facts in note ──────────────
-
-
-FACT_EXTRACTION_PROMPT = """Extract a single specific clinical fact from this note.
-Output the fact as a complete sentence using the note's actual values.
-
-Categories to extract from (pick whichever applies):
-- A specific medication with dose
-- A specific lab value with units
-- A specific procedure performed
-- A specific finding from physical exam
-
-Note:
-{note}
-
-Single fact:"""
-
-
-def task_fact_extraction(
-    teacher_model, teacher_tok, items: list[dict[str, Any]],
-    *, batch_size: int = 8,
-) -> list[dict[str, str]]:
-    """Generate (note → single specific fact) training pairs."""
-    prompts = [FACT_EXTRACTION_PROMPT.format(note=item["original"][:1800]) for item in items]
-
-    rows: list[dict[str, str]] = []
-    for start in range(0, len(prompts), batch_size):
-        batch_items = items[start:start + batch_size]
-        batch_prompts = prompts[start:start + batch_size]
-        outputs = batch_ask(teacher_model, teacher_tok, batch_prompts, max_tokens=120)
-        for item, out in zip(batch_items, outputs):
-            if len(out.strip()) < 15:
-                continue
-            rows.append({
-                "task": "fact_extraction",
-                "instruction": "Extract one specific medical fact from this note.",
-                "input": item["original"][:2500],
-                "output": out.strip()[:300],
-            })
-    return rows
-
-
-# ── Task 12: CORRECTION — train to say "I don't know" with confidence ──
-
-
-CORRECTION_PROMPT = """Generate ONE question that CANNOT be answered from this clinical note
-(asks for info that's clearly not in the document — e.g. "what's the patient's
-favorite color", "what time was the surgery scheduled" if no time is given,
-"what insurance does the patient have" if not stated).
-
-Note:
-{note}
-
-Output exactly:
-Q: <unanswerable question>"""
-
-
-def task_correction(
-    teacher_model, teacher_tok, items: list[dict[str, Any]],
-    *, batch_size: int = 8, max_examples: int = 150,
-) -> list[dict[str, str]]:
-    """Generate "I don't know" training pairs.
-
-    Trains the model to confidently refuse questions whose answers aren't
-    in the source. Reduces hallucination by teaching the bound of knowledge.
-    """
-    sample = items[:max_examples]
-    prompts = [CORRECTION_PROMPT.format(note=item["original"][:1800]) for item in sample]
-
-    rows: list[dict[str, str]] = []
-    canned_refusals = [
-        "Not specified in the document.",
-        "The note does not provide this information.",
-        "This is not stated in the source material.",
-    ]
-    rng_idx = 0
-    for start in range(0, len(prompts), batch_size):
-        batch_items = sample[start:start + batch_size]
-        batch_prompts = prompts[start:start + batch_size]
-        outputs = batch_ask(teacher_model, teacher_tok, batch_prompts, max_tokens=80)
-        for item, out in zip(batch_items, outputs):
-            # Extract the question from "Q: ..."
-            q_text = out.replace("Q:", "").strip()
-            q_text = q_text.split("\n")[0].strip()
-            if not q_text or len(q_text) < 10:
-                continue
-            answer = canned_refusals[rng_idx % len(canned_refusals)]
-            rng_idx += 1
-            rows.append({
-                "task": "correction",
-                "instruction": q_text[:200],
-                "input": item["original"][:2500],
-                "output": answer,
-            })
-    return rows
-
-
-# ── Task 8: Q&A — structured form + question → answer ────────────────────
-# Uses the same skip-empty + has_content_for_question helpers as the legacy
-# qa.py path, but only over REASONING-classified questions so we don't burn
-# training capacity on lookup answers (those go to RAG at serving time).
+# ── Task 3: QA — text + question → answer ────────────────────────────────
 
 
 def make_qa_prompt(domain: str, structured: dict[str, Any], question: str) -> str:
     context = json.dumps(structured, indent=2)[:1500]
     return f"""Domain: {domain}
 
-Structured data:
+Structured data extracted from the document:
 {context}
 
 Question: {question}
 
-Give a concise direct answer (1-3 sentences). Only state facts grounded in the structured data. If info is missing, say "Not specified in document."
+Give a concise direct answer (1-3 sentences). Only state facts grounded in the
+data above. If the info is missing, say "Not specified in the document."
+
 Answer:"""
 
 
@@ -570,18 +130,16 @@ def task_qa(
     questions_per_doc: int = 4,
     batch_size: int = 16,
 ) -> list[dict[str, str]]:
-    """Teacher-generated: traditional Q&A pairs, sampled over reasoning questions only."""
+    """Teacher-generated Q&A pairs over schema-derived questions."""
     if not questions:
         return []
 
     pairs: list[tuple[dict[str, Any], str, str]] = []
     for item in items:
-        # Sample N reasoning questions per doc that actually have content.
-        candidate = [q for q in questions if has_content_for_question(item["structured"], q)]
+        candidate = [q for q in questions if has_content_for_question(item.get("structured", {}), q)]
         if not candidate:
             continue
-        sample = candidate[:questions_per_doc]
-        for q in sample:
+        for q in candidate[:questions_per_doc]:
             pairs.append((item, q, make_qa_prompt(domain, item["structured"], q)))
 
     rows: list[dict[str, str]] = []
@@ -601,24 +159,170 @@ def task_qa(
     return rows
 
 
-# ── Top-level orchestrator ───────────────────────────────────────────────
+# ── Task 4: PARAPHRASE — text → same content, different words ────────────
 
 
-# Cap each task at this fraction of total docs to prevent summary/red_flags
-# from drowning out the rarer-but-important reasoning tasks (assessment,
-# continuation). Empirically determined: v3 had 63% summary+red_flags which
-# made the trained model behave like a summary writer instead of a clinician.
-MAX_PER_TASK_FRAC = 0.5  # cap any single task at 50% of #docs
+def make_paraphrase_prompt(domain: str, text: str) -> str:
+    return f"""Rephrase this {domain} document. Use different sentence structures
+and synonyms. Keep ALL facts identical (same names, numbers, dates, IDs,
+identifiers, quoted text). Maintain the original tone.
+
+Original:
+{text[:2000]}
+
+Paraphrased:"""
+
+
+def task_paraphrase(
+    teacher_model, teacher_tok, items: list[dict[str, Any]], domain: str,
+    *, batch_size: int = 8, max_examples: int = 200,
+) -> list[dict[str, str]]:
+    """Teacher-generated paraphrases. Skipped on short structured docs (logs)
+    where paraphrasing would damage exact-text extraction skills."""
+    candidates = [it for it in items if not _short_doc(it.get("original", ""))]
+    candidates = candidates[:max_examples]
+    if not candidates:
+        return []
+
+    prompts = [make_paraphrase_prompt(domain, it["original"]) for it in candidates]
+    instruction = f"Rewrite this {domain} document in different words while keeping all facts identical."
+
+    rows: list[dict[str, str]] = []
+    for start in range(0, len(prompts), batch_size):
+        batch_items = candidates[start:start + batch_size]
+        batch_prompts = prompts[start:start + batch_size]
+        outputs = batch_ask(teacher_model, teacher_tok, batch_prompts, max_tokens=400)
+        for item, out in zip(batch_items, outputs):
+            if len(out.strip()) < 100:
+                continue
+            rows.append({
+                "task": "paraphrase",
+                "instruction": instruction,
+                "input": item["original"][:2500],
+                "output": out.strip()[:1500],
+            })
+    return rows
+
+
+# ── Task 5: YES_NO — bounded yes/no questions grounded in source ─────────
+
+
+def make_yes_no_prompt(domain: str, text: str) -> str:
+    return f"""You are creating training data for a {domain} assistant.
+
+Given this document, write 2 yes/no questions a user might ask, with their
+correct answers. Questions must have unambiguous yes/no answers grounded
+strictly in the document's content.
+
+Document:
+{text[:1800]}
+
+Output exactly 2 lines, each in this format:
+Q: <question> | A: <Yes or No>
+
+Lines:"""
+
+
+def task_yes_no(
+    teacher_model, teacher_tok, items: list[dict[str, Any]], domain: str,
+    *, batch_size: int = 8,
+) -> list[dict[str, str]]:
+    """Teacher-generated yes/no Q&A. Trains the model to give bounded answers."""
+    if not items:
+        return []
+    prompts = [make_yes_no_prompt(domain, it["original"]) for it in items]
+
+    rows: list[dict[str, str]] = []
+    for start in range(0, len(prompts), batch_size):
+        batch_items = items[start:start + batch_size]
+        batch_prompts = prompts[start:start + batch_size]
+        outputs = batch_ask(teacher_model, teacher_tok, batch_prompts, max_tokens=200)
+        for item, out in zip(batch_items, outputs):
+            for line in out.split("\n"):
+                line = line.strip()
+                if "|" not in line:
+                    continue
+                q_part, _, a_part = line.partition("|")
+                q = q_part.replace("Q:", "").strip()
+                a = a_part.replace("A:", "").strip()
+                if not q or a.lower() not in ("yes", "no"):
+                    continue
+                rows.append({
+                    "task": "yes_no",
+                    "instruction": q[:200],
+                    "input": item["original"][:2500],
+                    "output": a.capitalize(),
+                })
+    return rows
+
+
+# ── Task 6: REFUSE — confidently say "I don't know" for out-of-doc questions ─
+
+
+def make_refuse_prompt(domain: str, text: str) -> str:
+    return f"""Generate ONE question that CANNOT be answered from this {domain}
+document — it asks for information that is clearly NOT present in the text
+(e.g. demographics, dates, names, values, or fields that the document does
+not mention at all).
+
+Document:
+{text[:1800]}
+
+Output exactly:
+Q: <unanswerable question>"""
+
+
+CANNED_REFUSALS = (
+    "Not specified in the document.",
+    "The document does not provide this information.",
+    "This is not stated in the source material.",
+)
+
+
+def task_refuse(
+    teacher_model, teacher_tok, items: list[dict[str, Any]], domain: str,
+    *, batch_size: int = 8, max_examples: int = 150,
+) -> list[dict[str, str]]:
+    """Teacher-generated refusals. Trains the model to confidently reject
+    questions whose answers aren't in the source — reduces hallucination."""
+    sample = items[:max_examples]
+    if not sample:
+        return []
+    prompts = [make_refuse_prompt(domain, it["original"]) for it in sample]
+
+    rows: list[dict[str, str]] = []
+    for start in range(0, len(prompts), batch_size):
+        batch_items = sample[start:start + batch_size]
+        batch_prompts = prompts[start:start + batch_size]
+        outputs = batch_ask(teacher_model, teacher_tok, batch_prompts, max_tokens=80)
+        for i, (item, out) in enumerate(zip(batch_items, outputs)):
+            q_text = out.replace("Q:", "").strip().split("\n")[0].strip()
+            if not q_text or len(q_text) < 10:
+                continue
+            answer = CANNED_REFUSALS[(start + i) % len(CANNED_REFUSALS)]
+            rows.append({
+                "task": "refuse",
+                "instruction": q_text[:200],
+                "input": item["original"][:2500],
+                "output": answer,
+            })
+    return rows
+
+
+# ── Balancer + orchestrator ──────────────────────────────────────────────
+
+
+# Cap any single task at this fraction of n_docs to prevent dominance.
+# Empirical: in v3 medical, removing the cap let summary+red_flags drown
+# out the rarer tasks and the model learned to write summaries instead of
+# extract structured info.
+MAX_PER_TASK_FRAC = 0.5
 
 
 def _balance_curriculum(
     rows: list[dict[str, str]], n_docs: int
 ) -> list[dict[str, str]]:
-    """Cap any task that exceeds MAX_PER_TASK_FRAC * n_docs.
-
-    Random-sample down to the cap so the model gets a balanced curriculum.
-    Tasks below the cap are left untouched.
-    """
+    """Cap each task at MAX_PER_TASK_FRAC * n_docs (with a 50-row floor)."""
     cap = max(int(n_docs * MAX_PER_TASK_FRAC), 50)
     by_task: dict[str, list[dict[str, str]]] = defaultdict(list)
     for r in rows:
@@ -628,7 +332,7 @@ def _balance_curriculum(
     for task, task_rows in by_task.items():
         if len(task_rows) > cap:
             sampled = random.sample(task_rows, cap)
-            print(f"  balancing: {task} {len(task_rows)} → {cap}")
+            print(f"  balancing: {task} {len(task_rows)} → {cap}", flush=True)
             balanced.extend(sampled)
         else:
             balanced.extend(task_rows)
@@ -643,12 +347,12 @@ def generate_curriculum(
     domain: str,
     *,
     on_progress: Callable[[str, int, int], None] | None = None,
-    include_new_tasks: bool = True,
+    include_new_tasks: bool = True,  # kept for back-compat with run.py CLI flag
 ) -> list[dict[str, str]]:
-    """Run all 8 tasks and return the combined training set.
+    """Run the 6 universal tasks and return the combined training set.
 
-    Self-generating tasks (1-3) run first — free, fast. Then teacher tasks
-    (4-8) run sequentially against the loaded teacher model.
+    `include_new_tasks` is preserved for run.py CLI compatibility but no longer
+    gates anything — every task here is universal and runs on every domain.
     """
 
     def _emit(task_name: str, rows: list[dict[str, str]]) -> None:
@@ -658,64 +362,34 @@ def generate_curriculum(
 
     all_rows: list[dict[str, str]] = []
 
-    # Tasks 1-3: self-generating, no LLM calls
-    rows = task_structure(structured_items)
-    _emit("1.structure", rows)
+    # 1. EXTRACT — self-generating, no teacher calls
+    rows = task_extract(structured_items, domain)
+    _emit("1.extract", rows)
     all_rows.extend(rows)
 
-    rows = task_continuation(structured_items)
-    _emit("2.continuation", rows)
-    all_rows.extend(rows)
-
-    rows = task_assessment_extraction(structured_items)
-    _emit("3.assessment", rows)
-    all_rows.extend(rows)
-
-    # Tasks 4-8: teacher (Llama 70B) calls
-    rows = task_differential(teacher_model, teacher_tok, structured_items)
-    _emit("4.differential", rows)
-    all_rows.extend(rows)
-
-    rows = task_red_flags(teacher_model, teacher_tok, structured_items)
-    _emit("5.red_flags", rows)
-    all_rows.extend(rows)
-
-    rows = task_pattern(teacher_model, teacher_tok, structured_items)
-    _emit("6.pattern", rows)
-    all_rows.extend(rows)
-
-    rows = task_summary(teacher_model, teacher_tok, structured_items)
-    _emit("7.summary", rows)
+    # 2-6. Teacher-generated tasks
+    rows = task_summarize(teacher_model, teacher_tok, structured_items, domain)
+    _emit("2.summarize", rows)
     all_rows.extend(rows)
 
     rows = task_qa(teacher_model, teacher_tok, structured_items, questions, domain)
-    _emit("8.qa", rows)
+    _emit("3.qa", rows)
     all_rows.extend(rows)
 
-    # Tasks 9-12: optional new task types (paraphrase, yes/no, fact_extraction, correction)
-    if include_new_tasks:
-        rows = task_paraphrase(teacher_model, teacher_tok, structured_items)
-        _emit("9.paraphrase", rows)
-        all_rows.extend(rows)
+    rows = task_paraphrase(teacher_model, teacher_tok, structured_items, domain)
+    _emit("4.paraphrase", rows)
+    all_rows.extend(rows)
 
-        rows = task_yes_no(teacher_model, teacher_tok, structured_items)
-        _emit("10.yes_no", rows)
-        all_rows.extend(rows)
+    rows = task_yes_no(teacher_model, teacher_tok, structured_items, domain)
+    _emit("5.yes_no", rows)
+    all_rows.extend(rows)
 
-        rows = task_fact_extraction(teacher_model, teacher_tok, structured_items)
-        _emit("11.fact_extraction", rows)
-        all_rows.extend(rows)
+    rows = task_refuse(teacher_model, teacher_tok, structured_items, domain)
+    _emit("6.refuse", rows)
+    all_rows.extend(rows)
 
-        rows = task_correction(teacher_model, teacher_tok, structured_items)
-        _emit("12.correction", rows)
-        all_rows.extend(rows)
-        n_tasks = 12
-    else:
-        n_tasks = 8
+    print(f"\n✅ Curriculum raw: {len(all_rows)} examples across 6 tasks", flush=True)
 
-    print(f"\n✅ Curriculum raw: {len(all_rows)} examples across {n_tasks} tasks", flush=True)
-
-    # Balance — prevent any one task from dominating training
     all_rows = _balance_curriculum(all_rows, n_docs=len(structured_items))
     print(f"✅ Curriculum balanced: {len(all_rows)} training examples", flush=True)
     return all_rows

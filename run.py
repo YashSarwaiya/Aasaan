@@ -231,7 +231,7 @@ def run_data_prep(
         teacher, teacher_tok, structured, questions, domain,
         include_new_tasks=not skip_new_tasks,
     )
-    _eprint(f"✅ {len(curriculum_data)} curriculum examples (8 tasks)\n")
+    _eprint(f"✅ {len(curriculum_data)} curriculum examples (6 universal tasks)\n")
     with open(output_dir / "curriculum_data.json", "w") as f:
         json.dump(curriculum_data, f, indent=2)
 
