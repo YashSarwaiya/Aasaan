@@ -23,6 +23,7 @@ import gc
 import json
 import os
 import random
+import re
 from pathlib import Path
 
 import torch
@@ -50,13 +51,66 @@ Log line:
 JSON:"""
 
 
+# Fields the prompt does NOT ask for — skip them in scoring (they'd be 0% by construction)
+SKIP_FIELDS = {"EventId"}
+
+
+def _norm_template(s: str) -> str:
+    """Normalize a log event template: collapse <*> / * placeholders, strip whitespace."""
+    s = re.sub(r"<\*+>|\*+", "<*>", s)  # any *-style placeholder → canonical <*>
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.lower()
+
+
+def fields_match(field: str, expected, actual, *, lenient: bool) -> bool:
+    """Compare expected vs actual for a single field.
+
+    Strict: full string equality after stripping.
+    Lenient: per-field tolerance for legitimate format variants
+      - Date: ignore leading zeros (CSV import stripped them from GT)
+      - Date / Time: substring containment in either direction
+      - Component / Content: substring containment in either direction
+      - EventTemplate: normalize placeholders + whitespace, case-insensitive
+      - Level: case-insensitive
+    """
+    e = str(expected).strip()
+    a = str(actual).strip()
+
+    if e == a:
+        return True
+    if not lenient:
+        return False
+
+    if field == "Date":
+        if a.lstrip("0") == e.lstrip("0"):
+            return True
+        if a in e or e in a:
+            return True
+    if field == "Time":
+        if a in e or e in a:
+            return True
+    if field == "Component" or field == "Content":
+        if a and e and (a in e or e in a):
+            return True
+    if field == "EventTemplate":
+        if _norm_template(a) == _norm_template(e):
+            return True
+    if field == "Level":
+        if a.lower() == e.lower():
+            return True
+    return False
+
+
 def evaluate_model(model, tokenizer, test_entries: list[dict], batch_size: int) -> dict:
-    """Score the model on a list of test entries. Returns aggregate metrics."""
+    """Score model on test set. Returns BOTH strict and lenient metrics."""
     n = len(test_entries)
-    field_correct: dict[str, int] = {}
-    field_total: dict[str, int] = {}
     json_valid = 0
     per_entry: list[dict] = []
+
+    # Per-field counters for strict + lenient
+    field_total: dict[str, int] = {}
+    strict_correct: dict[str, int] = {}
+    lenient_correct: dict[str, int] = {}
 
     for start in range(0, n, batch_size):
         batch = test_entries[start:start + batch_size]
@@ -65,70 +119,92 @@ def evaluate_model(model, tokenizer, test_entries: list[dict], batch_size: int) 
 
         for entry, raw_response in zip(batch, responses):
             predicted = extract_json(raw_response)
+            gt = entry["ground_truth"]
+
             if predicted is None:
                 per_entry.append({
                     "raw_log": entry["raw_log"],
-                    "ground_truth": entry["ground_truth"],
+                    "ground_truth": gt,
                     "raw_response": raw_response[:400],
                     "predicted": None,
                 })
-                # All fields count as wrong
-                for field in entry["ground_truth"]:
+                for field in gt:
+                    if field in SKIP_FIELDS:
+                        continue
                     field_total[field] = field_total.get(field, 0) + 1
                 continue
 
             json_valid += 1
-            for field, expected in entry["ground_truth"].items():
+            for field, expected in gt.items():
+                if field in SKIP_FIELDS:
+                    continue
                 field_total[field] = field_total.get(field, 0) + 1
                 actual = predicted.get(field, "")
-                if str(actual).strip() == str(expected).strip():
-                    field_correct[field] = field_correct.get(field, 0) + 1
+                if fields_match(field, expected, actual, lenient=False):
+                    strict_correct[field] = strict_correct.get(field, 0) + 1
+                if fields_match(field, expected, actual, lenient=True):
+                    lenient_correct[field] = lenient_correct.get(field, 0) + 1
             per_entry.append({
                 "raw_log": entry["raw_log"],
-                "ground_truth": entry["ground_truth"],
+                "ground_truth": gt,
                 "predicted": predicted,
             })
 
         print(f"  [{min(start + batch_size, n)}/{n}]", flush=True)
 
-    field_accuracy = {
-        f: round(100 * field_correct.get(f, 0) / field_total[f], 1)
-        for f in field_total
-    }
-    overall = round(
-        100 * sum(field_correct.values()) / max(sum(field_total.values()), 1),
-        1,
-    )
+    def _fields_pct(correct: dict[str, int]) -> dict[str, float]:
+        return {
+            f: round(100 * correct.get(f, 0) / field_total[f], 1)
+            for f in field_total
+        }
+
+    def _overall_pct(correct: dict[str, int]) -> float:
+        return round(
+            100 * sum(correct.values()) / max(sum(field_total.values()), 1),
+            1,
+        )
+
     return {
         "n": n,
         "json_valid_pct": round(100 * json_valid / n, 1),
-        "field_accuracy": field_accuracy,
-        "overall_accuracy": overall,
+        "strict": {
+            "field_accuracy": _fields_pct(strict_correct),
+            "overall_accuracy": _overall_pct(strict_correct),
+        },
+        "lenient": {
+            "field_accuracy": _fields_pct(lenient_correct),
+            "overall_accuracy": _overall_pct(lenient_correct),
+        },
         "per_entry": per_entry,
     }
 
 
 def print_summary(name: str, result: dict) -> None:
     print(f"\n--- {name} ---")
-    print(f"  json valid: {result['json_valid_pct']}%   overall: {result['overall_accuracy']}%")
-    for f, acc in sorted(result["field_accuracy"].items()):
-        print(f"    {f:<16} {acc}%")
+    print(f"  json valid: {result['json_valid_pct']}%")
+    print(f"  STRICT  overall: {result['strict']['overall_accuracy']}%")
+    print(f"  LENIENT overall: {result['lenient']['overall_accuracy']}%")
+    print(f"  {'field':<18} {'strict':>8} {'lenient':>9}")
+    for f in sorted(result["strict"]["field_accuracy"]):
+        s = result["strict"]["field_accuracy"][f]
+        l = result["lenient"]["field_accuracy"][f]
+        print(f"    {f:<16} {s:>7}% {l:>8}%")
 
 
-def print_comparison(results: dict[str, dict]) -> None:
-    """Print a side-by-side table of all models × all fields."""
-    fields = sorted({f for r in results.values() for f in r["field_accuracy"]})
+def print_comparison(results: dict[str, dict], mode: str = "lenient") -> None:
+    """Print a side-by-side table for one mode (strict or lenient)."""
+    fields = sorted({f for r in results.values() for f in r[mode]["field_accuracy"]})
     header = f"{'model':<20}" + "".join(f"{f[:12]:>14}" for f in fields) + f"{'overall':>14}{'json%':>10}"
     print("\n" + "=" * len(header))
-    print("COMPARISON")
+    print(f"COMPARISON ({mode.upper()})")
     print("=" * len(header))
     print(header)
     print("-" * len(header))
     for name, r in results.items():
         row = f"{name[:20]:<20}"
         for f in fields:
-            row += f"{r['field_accuracy'].get(f, 0):>13.1f}%"
-        row += f"{r['overall_accuracy']:>13.1f}%"
+            row += f"{r[mode]['field_accuracy'].get(f, 0):>13.1f}%"
+        row += f"{r[mode]['overall_accuracy']:>13.1f}%"
         row += f"{r['json_valid_pct']:>9.1f}%"
         print(row)
     print("=" * len(header))
@@ -206,8 +282,9 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # ── Comparison + save ─────────────────────────────────────────────
-    print_comparison(results)
+    # ── Comparison + save (both modes) ────────────────────────────────
+    print_comparison(results, mode="strict")
+    print_comparison(results, mode="lenient")
 
     summary = {
         name: {k: v for k, v in r.items() if k != "per_entry"}
