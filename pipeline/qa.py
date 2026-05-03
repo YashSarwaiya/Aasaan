@@ -209,7 +209,7 @@ def filter_clean(training_data: list[dict[str, str]]) -> list[dict[str, str]]:
     return filtered
 
 
-# ── Grounding validator (Qwen 32B as judge) ──────────────────────────────
+# ── Grounding validator (Llama 70B as judge) ─────────────────────────────
 
 
 GROUNDING_PROMPT = """You are a strict but fair clinical fact checker.
@@ -256,7 +256,7 @@ def validate_grounded(
     """Validate every training pair against its source note using a teacher LLM.
 
     Same pattern as `judge.py` (the eval scorer). Returns (kept_pairs, dropped_count).
-    The judge model should be Qwen 32B — generates calls expensive but only
+    The judge model should be Llama 70B — generates calls expensive but only
     ~4 max-tokens per call so it's fast.
 
     SAFETY: parse failures default to KEEP (1), so a malformed judge response

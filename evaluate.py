@@ -1,9 +1,9 @@
 """
 Three-way side-by-side evaluation:
 
-  1. baseline    stock Qwen 2.5 7B, given the raw note only
+  1. baseline    stock Llama 3.1 8B, given the raw note only
   2. trained     base + your LoRA adapter, given the raw note only
-  3. rag         stock Qwen given the EXTRACTED STRUCTURED FORM (as JSON) instead of raw note
+  3. rag         stock Llama given the EXTRACTED STRUCTURED FORM (as JSON) instead of raw note
 
 Same questions, same held-out test notes for all three.
 
@@ -40,7 +40,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
 
-BASE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 QUESTIONS = [
     "What is the diagnosis?",
     "What medications is the patient on?",
@@ -130,7 +130,7 @@ def main():
     def find_structured(note_idx: int) -> dict | None:
         return structured_by_idx.get(note_idx)
 
-    # ── Mode 1: baseline (raw note → stock Qwen) ─────────────────────────
+    # ── Mode 1: baseline (raw note → stock Llama) ────────────────────────
     print("\n" + "=" * 60)
     print("MODE 1: baseline (raw note, no training)")
     print("=" * 60)
@@ -141,10 +141,10 @@ def main():
             baseline_answers.append({"note_idx": i, "question": q, "answer": ans})
         print(f"  {i + 1}/{len(test_notes)}")
 
-    # ── Mode 3: RAG (stock Qwen + structured form as context) ────────────
+    # ── Mode 3: RAG (stock Llama + structured form as context) ───────────
     #    Note: we keep the same base model loaded, no PEFT yet
     print("\n" + "=" * 60)
-    print("MODE 3: RAG (stock Qwen + structured form)")
+    print("MODE 3: RAG (stock Llama + structured form)")
     print("=" * 60)
     rag_answers = []
     for i, note in enumerate(test_notes):

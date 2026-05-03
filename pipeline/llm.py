@@ -12,8 +12,8 @@ from typing import Any
 import torch
 
 
-def load_model(model_name: str = "Qwen/Qwen2.5-7B-Instruct"):
-    """Load Qwen base model + tokenizer with bf16 + auto device map."""
+def load_model(model_name: str = "meta-llama/Llama-3.1-8B-Instruct"):
+    """Load student base model + tokenizer with bf16 + auto device map."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -31,7 +31,7 @@ def load_model(model_name: str = "Qwen/Qwen2.5-7B-Instruct"):
 
 
 def load_teacher(
-    model_name: str = "Qwen/Qwen2.5-32B-Instruct",
+    model_name: str = "meta-llama/Llama-3.1-70B-Instruct",
     *,
     quantize_4bit: bool | None = None,
 ):
@@ -39,8 +39,8 @@ def load_teacher(
     the grounding validator.
 
     Auto-detects whether 4-bit quantization is needed: if the GPU has < 60 GB
-    free, falls back to bnb 4-bit (Qwen 32B at 4-bit ≈ 16 GB, fits on a 22 GB
-    L4). On B200 (180 GB) it loads in bf16 for full quality.
+    free, falls back to bnb 4-bit (Llama 70B at 4-bit ≈ 35 GB, fits on a 48 GB
+    A6000; tight on 22 GB L4). On B200 (180 GB) it loads in bf16 for full quality.
 
     `quantize_4bit=True/False` lets the caller force a mode for testing.
     """

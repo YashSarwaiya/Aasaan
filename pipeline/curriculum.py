@@ -15,7 +15,7 @@ Tasks:
   8. QA              — structured form + question → direct answer
 
 Tasks 1-3 are self-generating (text manipulation on existing extracted data,
-no LLM calls). Tasks 4-8 use the teacher (Qwen 32B) to produce the output.
+no LLM calls). Tasks 4-8 use the teacher (Llama 70B) to produce the output.
 
 Each row is shaped like {instruction, input, output, task} ready for SFT.
 The `task` field is for analysis only — `train.py` ignores it.
@@ -671,7 +671,7 @@ def generate_curriculum(
     _emit("3.assessment", rows)
     all_rows.extend(rows)
 
-    # Tasks 4-8: teacher (Qwen 32B) calls
+    # Tasks 4-8: teacher (Llama 70B) calls
     rows = task_differential(teacher_model, teacher_tok, structured_items)
     _emit("4.differential", rows)
     all_rows.extend(rows)

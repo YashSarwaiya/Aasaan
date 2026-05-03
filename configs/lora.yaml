@@ -17,7 +17,7 @@
 # {instruction, input, output} which is exactly what curriculum.py emits.
 
 ### model
-model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+model_name_or_path: meta-llama/Llama-3.1-8B-Instruct
 trust_remote_code: true
 
 ### method
@@ -31,7 +31,7 @@ lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
 
 ### dataset
 dataset: aasaan_curriculum   # registered in data/dataset_info.json
-template: qwen
+template: llama3
 cutoff_len: 2048
 max_samples: 100000
 overwrite_cache: true

@@ -106,7 +106,7 @@ def run_data_prep(
     num: int,
     extract_batch_size: int,
     qa_batch_size: int,
-    teacher_model_name: str = "Qwen/Qwen2.5-32B-Instruct",
+    teacher_model_name: str = "meta-llama/Llama-3.1-70B-Instruct",
     *,
     skip_refine: bool = False,
     skip_quality_filter: bool = False,
@@ -114,15 +114,15 @@ def run_data_prep(
     skip_dpo: bool = False,
 ) -> dict:
     """Multi-phase pipeline: load → domain → schema (with field split) → extract
-    → multi-task curriculum (Qwen 32B teacher) → grounded validation (same 32B)
+    → multi-task curriculum (Llama 70B teacher) → grounded validation (same 70B)
     → final clean training set.
 
     Saves all artifacts under output_dir. Returns metadata about the run.
 
     Two model loads:
-      1. Qwen 7B for domain/schema/extraction (steps 1-4)
-      2. Qwen 32B for curriculum + validation (steps 5-6)
-      Then 7B reloaded for training in run_training().
+      1. Llama 8B for domain/schema/extraction (steps 1-4)
+      2. Llama 70B for curriculum + validation (steps 5-6)
+      Then 8B reloaded for training in run_training().
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
@@ -139,8 +139,8 @@ def run_data_prep(
     docs, n_dropped_dups = dedup.deduplicate(docs, threshold=0.85)
     docs, n_pii_redacted = pii.anonymize_documents(docs)
 
-    _eprint(f"\n🤖 Loading Qwen 2.5 7B Instruct (extractor)...")
-    model, tokenizer = llm.load_model("Qwen/Qwen2.5-7B-Instruct")
+    _eprint(f"\n🤖 Loading Llama 3.1 8B Instruct (extractor)...")
+    model, tokenizer = llm.load_model("meta-llama/Llama-3.1-8B-Instruct")
     _eprint("✅ Extractor loaded\n")
 
     # ── 1. Detect domain ─────────────────────────────────────────────
@@ -206,13 +206,13 @@ def run_data_prep(
     with open(output_dir / "structured.json", "w") as f:
         json.dump(structured, f, indent=2)
 
-    # ── Free Qwen 7B before loading the 32B teacher ──────────────────
+    # ── Free Llama 8B before loading the 70B teacher ─────────────────
     _eprint("🧹 Freeing 7B from GPU before loading 32B teacher...")
     llm.unload_model(model)
     del tokenizer
     _eprint("✅ Memory cleared\n")
 
-    # ── 5. Multi-task curriculum (Qwen 32B teacher) ──────────────────
+    # ── 5. Multi-task curriculum (Llama 70B teacher) ─────────────────
     _eprint("=" * 60)
     _eprint(f"STEP 5: 🎓 multi-task curriculum (teacher = {teacher_model_name})")
     _eprint("=" * 60)
@@ -415,8 +415,8 @@ def run_training(output_dir: Path, epochs: int) -> dict:
     if len(clean) < 20:
         raise SystemExit(f"only {len(clean)} clean pairs — need at least 20")
 
-    _eprint("\n🤖 Loading Qwen 2.5 7B Instruct for fine-tuning...")
-    model, tokenizer = llm.load_model("Qwen/Qwen2.5-7B-Instruct")
+    _eprint("\n🤖 Loading Llama 3.1 8B Instruct for fine-tuning...")
+    model, tokenizer = llm.load_model("meta-llama/Llama-3.1-8B-Instruct")
     _eprint("✅ Model loaded\n")
 
     _eprint("=" * 60)

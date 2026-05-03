@@ -133,7 +133,7 @@ def main():
     )
     ap.add_argument("--output", type=Path, default=Path("contam_results.json"))
     ap.add_argument(
-        "--model", default="Qwen/Qwen2.5-7B-Instruct", help="Base model under test"
+        "--model", default="meta-llama/Llama-3.1-8B-Instruct", help="Base model under test"
     )
     args = ap.parse_args()
 
