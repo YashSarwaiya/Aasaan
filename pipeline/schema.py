@@ -18,10 +18,9 @@ ambiguous fields (since the user can always demote a field via the UI later).
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
-from .llm import ask, extract_json, extract_json_list
+from .llm import ask, extract_json
 
 
 # Keyword groups for field classification. A field is LOOKUP if it has more
