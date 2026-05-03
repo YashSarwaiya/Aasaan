@@ -6,16 +6,22 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64gb
-#SBATCH --time=04:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=logs/aasaan-%j.out
 
 # Usage:
-#   sbatch run.sbatch <input-file> [<column>] [<num-docs>]
+#   sbatch run.sbatch <input-file> [<column>] [<num-docs>] [<version>]
+#
+# Versions:
+#   v3 — lean baseline: original 8 tasks, no refine, no quality, no DPO
+#   v4 — v3 + refine          (best on synthetic medical: 93.8%)
+#   v5 — everything on        (refine + quality filter + new tasks + DPO)
+#   v6 — refine + new tasks   (no quality filter, no DPO)
 #
 # Examples:
-#   sbatch run.sbatch /blue/dferris/y.sarwaiya/test/mtsample/mtsamples.csv
-#   sbatch run.sbatch ./contracts.pdf
-#   sbatch run.sbatch ./crm_notes.csv content 500
+#   sbatch run.sbatch ./loghub_data/loghub_train.csv raw_log 200 v4
+#   sbatch run.sbatch ./loghub_data/loghub_train.csv raw_log 200 v3
+#   sbatch run.sbatch ./contracts.pdf "" 500 v5
 
 set -euo pipefail
 
@@ -28,17 +34,26 @@ export HF_HOME=/blue/dferris/y.sarwaiya/hf_cache
 export TRANSFORMERS_CACHE=$HF_HOME
 export HF_HUB_CACHE=$HF_HOME
 
-INPUT="${1:?usage: sbatch run.sbatch <input-file> [<column>] [<num-docs>]}"
+INPUT="${1:?usage: sbatch run.sbatch <input-file> [<column>] [<num-docs>] [<version>]}"
 COLUMN="${2:-}"
 NUM="${3:-250}"
+VERSION="${4:-v4}"
 
-OUTDIR="./output_$(date +%Y%m%d_%H%M%S)"
+case "$VERSION" in
+  v3) EXTRA_FLAGS=(--v3-mode) ;;
+  v4) EXTRA_FLAGS=(--skip-quality-filter --skip-new-tasks --skip-dpo) ;;
+  v5) EXTRA_FLAGS=() ;;
+  v6) EXTRA_FLAGS=(--skip-quality-filter --skip-dpo) ;;
+  *)  echo "unknown version: $VERSION (expected v3|v4|v5|v6)" >&2; exit 1 ;;
+esac
 
-ARGS=(--input "$INPUT" --num "$NUM" --output "$OUTDIR" --train --v3-mode)
+OUTDIR="./output_${VERSION}_$(date +%Y%m%d_%H%M%S)"
+
+ARGS=(--input "$INPUT" --num "$NUM" --output "$OUTDIR" --train "${EXTRA_FLAGS[@]}")
 if [[ -n "$COLUMN" ]]; then
   ARGS+=(--column "$COLUMN")
 fi
 
-echo "[$(date)] starting aasaan pipeline → $OUTDIR"
+echo "[$(date)] starting aasaan pipeline ($VERSION) → $OUTDIR"
 python run.py "${ARGS[@]}"
 echo "[$(date)] done → $OUTDIR"
