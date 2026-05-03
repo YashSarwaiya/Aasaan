@@ -53,7 +53,24 @@ REASONING_KEYWORDS = (
 )
 
 
-def classify_fields(schema: dict[str, str]) -> tuple[list[str], list[str]]:
+def _desc_to_text(desc: Any) -> str:
+    """Coerce a schema description to plain text. Llama sometimes returns
+    {"type": "string", "description": "..."} or other dict shapes instead of
+    a flat string — pull the description out, fall back to stringification."""
+    if desc is None:
+        return ""
+    if isinstance(desc, str):
+        return desc
+    if isinstance(desc, dict):
+        for key in ("description", "desc", "doc", "summary", "explanation"):
+            v = desc.get(key)
+            if isinstance(v, str) and v:
+                return v
+        return " ".join(str(v) for v in desc.values() if isinstance(v, (str, int, float)))
+    return str(desc)
+
+
+def classify_fields(schema: dict[str, Any]) -> tuple[list[str], list[str]]:
     """Split schema fields into (lookup_fields, reasoning_fields).
 
     LOOKUP fields are served via RAG. REASONING fields are training targets.
@@ -63,7 +80,7 @@ def classify_fields(schema: dict[str, str]) -> tuple[list[str], list[str]]:
     lookup: list[str] = []
     reasoning: list[str] = []
     for name, desc in schema.items():
-        text = (name + " " + (desc or "")).lower()
+        text = (name + " " + _desc_to_text(desc)).lower()
         lookup_hits = sum(1 for kw in LOOKUP_KEYWORDS if kw in text)
         reasoning_hits = sum(1 for kw in REASONING_KEYWORDS if kw in text)
         if lookup_hits > reasoning_hits:
@@ -71,6 +88,12 @@ def classify_fields(schema: dict[str, str]) -> tuple[list[str], list[str]]:
         else:
             reasoning.append(name)
     return lookup, reasoning
+
+
+def normalize_schema(raw: dict[str, Any]) -> dict[str, str]:
+    """Flatten LLM schema output to {field: str_description}. Tolerates the
+    nested {field: {type, description}} shape Llama tends to produce."""
+    return {name: _desc_to_text(val) for name, val in raw.items()}
 
 
 def detect_domain(model, tokenizer, sample_docs: list[str]) -> str:
@@ -87,8 +110,14 @@ DOCUMENTS:
 Output ONLY the domain name in 2-5 words.
 Examples: "medical clinical notes", "legal contracts", "sales call logs", "software bug reports"
 Domain:"""
-    domain = ask(model, tokenizer, prompt, max_tokens=20).strip().strip('"').strip("'")
-    return domain.split("\n")[0].strip()
+    raw = ask(model, tokenizer, prompt, max_tokens=60).strip()
+    # Strip common verbose preambles Llama tends to add ("Based on the content
+    # of the documents:", "The domain is:", quotes, etc.) and grab the last
+    # non-empty meaningful line.
+    cleaned = raw.replace("Based on the content of the documents:", "").strip()
+    cleaned = cleaned.replace("The domain is", "").strip(": \"'\n\t.")
+    lines = [l.strip(": \"'\n\t.") for l in cleaned.splitlines() if l.strip()]
+    return (lines[-1] if lines else "general documents")[:80]
 
 
 # Fallback schema — used only when both LLM attempts produce malformed JSON.
@@ -157,6 +186,10 @@ ONLY JSON, nothing else:"""
 
     if schema is None or len(schema) < 5:
         return dict(DEFAULT_SCHEMA)
+
+    # Flatten any nested {type, description} shapes (Llama-style) into plain
+    # {field: str} so downstream code can rely on string descriptions.
+    schema = normalize_schema(schema)
 
     # Strip any patient_name / patient_id field that snuck through despite the prompt.
     schema = {

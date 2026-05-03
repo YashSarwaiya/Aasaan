@@ -47,6 +47,12 @@ case "$VERSION" in
   *)  echo "unknown version: $VERSION (expected v3|v4|v5|v6)" >&2; exit 1 ;;
 esac
 
+# LogHub (and any other short/templated input) benefits from disabling
+# MinHash dedup, which would otherwise drop ~80% as near-duplicates.
+if [[ "$INPUT" == *loghub* || "$INPUT" == *log* ]]; then
+  EXTRA_FLAGS+=(--no-dedup)
+fi
+
 OUTDIR="./output_${VERSION}_$(date +%Y%m%d_%H%M%S)"
 
 ARGS=(--input "$INPUT" --num "$NUM" --output "$OUTDIR" --train "${EXTRA_FLAGS[@]}")

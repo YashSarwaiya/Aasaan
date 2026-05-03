@@ -112,6 +112,7 @@ def run_data_prep(
     skip_quality_filter: bool = False,
     skip_new_tasks: bool = False,
     skip_dpo: bool = False,
+    skip_dedup: bool = False,
 ) -> dict:
     """Multi-phase pipeline: load → domain → schema (with field split) → extract
     → multi-task curriculum (Llama 70B teacher) → grounded validation (same 70B)
@@ -133,10 +134,16 @@ def run_data_prep(
 
     # ── Pre-pipeline data quality steps ──────────────────────────────
     # Both are no-ops on missing optional deps (datasketch / presidio).
+    # Skip dedup for highly-templated short docs (e.g. log lines) where
+    # MinHash falsely flags everything as a near-duplicate.
     _eprint("\n=" * 60)
     _eprint("STEP 0: 🧹 dedup + PII stripping")
     _eprint("=" * 60)
-    docs, n_dropped_dups = dedup.deduplicate(docs, threshold=0.85)
+    if skip_dedup:
+        _eprint("  ⏭️  dedup skipped (--no-dedup)")
+        n_dropped_dups = 0
+    else:
+        docs, n_dropped_dups = dedup.deduplicate(docs, threshold=0.85)
     docs, n_pii_redacted = pii.anonymize_documents(docs)
 
     _eprint(f"\n🤖 Loading Llama 3.1 8B Instruct (extractor)...")
@@ -489,6 +496,8 @@ def main():
                         help="use only 8 original tasks (no paraphrase/yes_no/fact/correction)")
     parser.add_argument("--skip-dpo", action="store_true",
                         help="skip DPO preference pair generation")
+    parser.add_argument("--no-dedup", action="store_true",
+                        help="skip MinHash deduplication (use for short/templated docs like logs)")
     parser.add_argument("--v3-mode", action="store_true",
                         help="shortcut: enables --skip-refine --skip-quality-filter --skip-new-tasks --skip-dpo (= original v3 behavior)")
     parser.add_argument(
@@ -545,6 +554,7 @@ def main():
         skip_quality_filter=args.skip_quality_filter,
         skip_new_tasks=args.skip_new_tasks,
         skip_dpo=args.skip_dpo,
+        skip_dedup=args.no_dedup,
     )
 
     if args.train:
