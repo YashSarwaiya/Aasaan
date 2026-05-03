@@ -182,24 +182,34 @@ PLACEHOLDER_PATTERNS = [
 def filter_clean(training_data: list[dict[str, str]]) -> list[dict[str, str]]:
     """Drop refusal / placeholder / too-short rows.
 
-    Two-layer defense alongside has_content_for_question(). CRITICAL — without
-    this, the model trains on junk answers and inference quality collapses.
+    Task-aware: some tasks are exempt from certain filters because their
+    output is supposed to be short or refusal-shaped by design.
+      - yes_no: 2-3 char answers are valid
+      - refuse: refusal-style answers ARE the training signal
+      - extract: JSON output, length varies, no refusal patterns expected
     """
+    # Exempt these from the short-answer filter (yes_no produces 2-3 char answers)
+    SKIP_LEN_CHECK = {"yes_no", "refuse"}
+    # Exempt refuse from the junk-pattern check — its whole purpose is to
+    # train the model to say "not in document" confidently.
+    SKIP_JUNK_CHECK = {"refuse"}
+
     filtered: list[dict[str, str]] = []
     for d in training_data:
         out_lower = d["output"].lower().strip()
+        task = d.get("task", "")
 
-        # Refusals / "I don't know" answers
-        if any(p in out_lower for p in JUNK_PATTERNS):
+        # Refusals / "I don't know" answers (skip for refuse task)
+        if task not in SKIP_JUNK_CHECK and any(p in out_lower for p in JUNK_PATTERNS):
             continue
         # Anonymization placeholders leaking through (case-insensitive)
         if any(p in out_lower for p in PLACEHOLDER_PATTERNS):
             continue
-        # "Unknown" near the start = refusal
-        if "unknown" in out_lower[:50]:
+        # "Unknown" near the start = refusal (skip for refuse task)
+        if task not in SKIP_JUNK_CHECK and "unknown" in out_lower[:50]:
             continue
-        # Too short to be a useful training example
-        if len(d["output"]) < 50:
+        # Too short to be useful (skip for yes_no/refuse tasks)
+        if task not in SKIP_LEN_CHECK and len(d["output"]) < 50:
             continue
         # First-person assistant deflection
         if out_lower.startswith(("i ", "i'm", "i can", "sorry", "as an ai")):
@@ -212,22 +222,22 @@ def filter_clean(training_data: list[dict[str, str]]) -> list[dict[str, str]]:
 # ── Grounding validator (Llama 70B as judge) ─────────────────────────────
 
 
-GROUNDING_PROMPT = """You are a strict but fair clinical fact checker.
+GROUNDING_PROMPT = """You are a strict but fair fact checker.
 
-Given the source clinical note and an answer the AI produced, score whether the answer is GROUNDED in the note.
+Given a source document and an answer the AI produced from it, score whether the answer is GROUNDED in the document.
 
 === RUBRIC ===
-1 = every fact in the answer is in the note (or correctly states the info is missing)
-0 = the answer contains made-up facts, hallucinated drugs/dates/conditions, or contradicts the note
+1 = every fact in the answer is supported by the document (or the answer correctly states the info is missing)
+0 = the answer contains made-up facts, hallucinated values/names/dates, or contradicts the document
 
-A confident "no medications" answer when the note says "PERTINENT MEDICATION: None" is GROUNDED (1).
-An answer that mentions a drug name not in the note is HALLUCINATED (0).
-An answer with placeholder text like "mm/dd/yyyy" is HALLUCINATED (0).
-An answer that adds clinical reasoning consistent with the note's facts is GROUNDED (1).
-An answer that invents specific numbers, dates, or names not in the note is HALLUCINATED (0).
+A confident "this information is not in the document" answer when the document genuinely lacks it is GROUNDED (1).
+An answer that adds reasoning consistent with the document's content is GROUNDED (1).
+An answer that mentions specific values, names, IDs, or dates not present in the document is HALLUCINATED (0).
+An answer with placeholder text like "mm/dd/yyyy" or "[name]" is HALLUCINATED (0).
+An answer that contradicts a fact stated in the document is HALLUCINATED (0).
 
 === CASE ===
-NOTE:
+DOCUMENT:
 {note}
 
 INSTRUCTION: {instruction}
@@ -253,17 +263,34 @@ def validate_grounded(
     batch_size: int = 8,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[list[dict[str, str]], int]:
-    """Validate every training pair against its source note using a teacher LLM.
+    """Validate every training pair against its source using an LLM judge.
 
-    Same pattern as `judge.py` (the eval scorer). Returns (kept_pairs, dropped_count).
-    The judge model should be Llama 70B — generates calls expensive but only
-    ~4 max-tokens per call so it's fast.
+    Task-aware: some tasks are exempt from grounding validation because the
+    judge can't reliably evaluate them:
+      - extract: JSON output is structural, not factual prose
+      - yes_no: binary answers are too short to validate
+      - refuse: by design says "not in document" — judge would reject
 
-    SAFETY: parse failures default to KEEP (1), so a malformed judge response
-    can't accidentally wipe out training data.
+    Returns (kept_pairs, dropped_count). Parse failures default to KEEP (1)
+    so a malformed judge response can't accidentally wipe out training data.
     """
     if not training_data:
         return [], 0
+
+    EXEMPT_TASKS = {"extract", "yes_no", "refuse"}
+
+    exempt = [d for d in training_data if d.get("task") in EXEMPT_TASKS]
+    to_judge = [d for d in training_data if d.get("task") not in EXEMPT_TASKS]
+
+    if exempt:
+        print(
+            f"  exempting {len(exempt)} pairs from grounding check "
+            f"(tasks: {sorted({d.get('task') for d in exempt})})",
+            flush=True,
+        )
+
+    if not to_judge:
+        return list(exempt), 0
 
     prompts = [
         GROUNDING_PROMPT.format(
@@ -271,14 +298,14 @@ def validate_grounded(
             instruction=d["instruction"],
             answer=d["output"][:600],
         )
-        for d in training_data
+        for d in to_judge
     ]
 
-    kept: list[dict[str, str]] = []
+    kept: list[dict[str, str]] = list(exempt)
     dropped = 0
-    total = len(training_data)
+    total = len(to_judge)
     for start in range(0, total, batch_size):
-        batch_data = training_data[start:start + batch_size]
+        batch_data = to_judge[start:start + batch_size]
         batch_prompts = prompts[start:start + batch_size]
         responses = batch_ask(judge_model, judge_tok, batch_prompts, max_tokens=4)
         for d, resp in zip(batch_data, responses):
@@ -291,7 +318,12 @@ def validate_grounded(
             on_progress(min(start + batch_size, total), total)
 
     print(
-        f"  validated {total} pairs → kept {len(kept)}, dropped {dropped} hallucinated",
+        f"  judged {total} pairs → kept {len(kept) - len(exempt)}, dropped {dropped}",
+        flush=True,
+    )
+    print(
+        f"  total grounded set: {len(kept)} ({len(exempt)} exempt + "
+        f"{len(kept) - len(exempt)} judge-passed)",
         flush=True,
     )
     return kept, dropped
