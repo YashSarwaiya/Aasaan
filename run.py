@@ -239,14 +239,16 @@ def run_data_prep(
         shape = schema.detect_task_shape(structured)
         _eprint(f"🔎 task shape detected: {shape}")
         if shape == "classification":
+            # DPO alone wins classification (+12pp on CUAD).
+            # Adding refine here hurts by 14.5pp — refine polishes labels into prose.
             skip_refine, skip_dpo = True, False
-            _eprint("   → enabling DPO (classification: best for label-shaped output)")
-        elif shape == "extraction":
-            skip_refine, skip_dpo = False, True
-            _eprint("   → enabling refine (extraction: best for verbatim output)")
-        else:  # mixed
+            _eprint("   → enabling DPO alone (classification: best for label-shaped output)")
+        else:
+            # Extraction OR mixed → refine + DPO combined (v3-best).
+            # On LogHub: refine+DPO scored 69.0% vs 52.7% (refine alone) and
+            # 49.0% (DPO alone). The two techniques only shine when combined.
             skip_refine, skip_dpo = False, False
-            _eprint("   → enabling refine + DPO (mixed: both behaviors needed)")
+            _eprint(f"   → enabling refine + DPO ({shape}: both techniques needed for extraction)")
         _eprint("")
     with open(output_dir / "curriculum_data.json", "w") as f:
         json.dump(curriculum_data, f, indent=2)
