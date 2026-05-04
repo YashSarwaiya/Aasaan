@@ -35,13 +35,19 @@ from pipeline.llm import batch_ask, extract_json
 
 BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
-def build_parse_prompt(fields: list[str]) -> str:
+def build_parse_prompt(fields: list[str], label_sets: dict[str, list[str]] | None = None) -> str:
     """Build a domain-agnostic extraction prompt from the ground-truth field set.
 
     Auto-derives which fields to ask for based on what the test set's ground
-    truths contain. Adds LogHub-specific guidance (verbatim extraction,
-    `<*>` placeholders) only when those fields are present.
+    truths contain. If `label_sets` is provided (mapping field -> list of
+    valid labels), includes them as constraints — turns extraction into
+    classification, which lifts accuracy dramatically when the answer space
+    is bounded (e.g. CUAD's 41 clause types).
+
+    Adds LogHub-specific guidance (verbatim extraction, `<*>` placeholders)
+    only when those fields are present.
     """
+    label_sets = label_sets or {}
     field_list = ", ".join(fields)
     rules = [
         "Use the EXACT substring from the input. Do NOT reformat or paraphrase.",
@@ -53,12 +59,28 @@ def build_parse_prompt(fields: list[str]) -> str:
             1,
             "For EventTemplate, replace variable parts (numbers, IDs, paths, blocks) with <*>.",
         )
+
+    label_constraints = ""
+    if label_sets:
+        label_blocks = []
+        for field, labels in label_sets.items():
+            label_blocks.append(
+                f"For \"{field}\", pick EXACTLY ONE of these {len(labels)} options "
+                f"(case-sensitive, no other values allowed):\n  "
+                + "\n  ".join(f"- {l}" for l in labels)
+            )
+        label_constraints = "\n\nLabel constraints:\n" + "\n\n".join(label_blocks)
+        rules.insert(
+            0,
+            "Use ONLY the exact label values listed in the Label constraints below. Do not invent new labels.",
+        )
+
     rules_str = "\n- ".join([""] + rules).strip()
 
     return (
         "You are an extraction tool. Parse this input into JSON.\n\n"
         f"Output ONLY valid JSON with these fields if present (omit any not in the input):\n"
-        f"- {field_list}\n\n"
+        f"- {field_list}{label_constraints}\n\n"
         f"Rules:\n- {rules_str}\n\n"
         "Input:\n{raw_log}\n\nJSON:"
     )
@@ -246,18 +268,41 @@ def main():
         test = test[:args.num]
     print(f"📂 evaluating {len(test)} test entries from {args.test_json}", flush=True)
 
-    # ── Derive the field set from the test ground truth ──────────────
+    # ── Derive the field set + label space from the test ground truth ──
     # Build the prompt around whichever fields the test set actually uses.
     # This lets the same script handle LogHub, CUAD, CRM, anything.
+    # If a field has a small bounded label set (5-200 unique values, all
+    # short strings), treat it as classification and include the labels
+    # in the prompt as constraints. Without this, classification tasks
+    # like CUAD score near-zero because the model has to guess CUAD's
+    # exact 41-label vocabulary from nothing.
     field_counts: dict[str, int] = {}
+    field_values: dict[str, set[str]] = {}
     for entry in test:
-        for field in entry.get("ground_truth", {}):
+        for field, value in entry.get("ground_truth", {}).items():
             if field in SKIP_FIELDS:
                 continue
             field_counts[field] = field_counts.get(field, 0) + 1
+            if isinstance(value, str):
+                field_values.setdefault(field, set()).add(value.strip())
     fields_to_extract = sorted(field_counts.keys())
-    parse_prompt = build_parse_prompt(fields_to_extract)
+
+    label_sets: dict[str, list[str]] = {}
+    for field, values in field_values.items():
+        n = len(values)
+        max_len = max((len(v) for v in values), default=0)
+        # Heuristic: if the field has a smallish bounded vocab of short values,
+        # treat as classification. Avoid log-style fields where every value
+        # is unique or long (timestamps, free text, etc.).
+        if 2 <= n <= 200 and max_len <= 80:
+            label_sets[field] = sorted(values)
+
+    parse_prompt = build_parse_prompt(fields_to_extract, label_sets=label_sets)
     print(f"📋 fields to extract: {fields_to_extract}", flush=True)
+    if label_sets:
+        for f, labels in label_sets.items():
+            print(f"📋 label set for '{f}': {len(labels)} options "
+                  f"(showing first 5: {labels[:5]})", flush=True)
 
     # ── Tokenizer (shared across all evals) ──────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
