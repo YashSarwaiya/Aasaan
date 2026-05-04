@@ -37,7 +37,7 @@ from pathlib import Path
 
 from pipeline import (
     curriculum, dedup, dpo, extract, llm, pii, qa,
-    quality, refine, schema, train,
+    refine, schema, train,
 )
 
 
@@ -109,10 +109,9 @@ def run_data_prep(
     teacher_model_name: str = "meta-llama/Llama-3.1-70B-Instruct",
     *,
     skip_refine: bool = False,
-    skip_quality_filter: bool = False,
-    skip_new_tasks: bool = False,
     skip_dpo: bool = False,
     skip_dedup: bool = False,
+    auto: bool = False,
 ) -> dict:
     """Multi-phase pipeline: load → domain → schema (with field split) → extract
     → multi-task curriculum (Llama 70B teacher) → grounded validation (same 70B)
@@ -229,9 +228,26 @@ def run_data_prep(
 
     curriculum_data = curriculum.generate_curriculum(
         teacher, teacher_tok, structured, questions, domain,
-        include_new_tasks=not skip_new_tasks,
     )
     _eprint(f"✅ {len(curriculum_data)} curriculum examples (6 universal tasks)\n")
+
+    # ── Auto-detect task shape and pick post-curriculum strategy ───────
+    # If --auto, inspect the structured extraction to decide whether this
+    # is a classification task (use DPO) or extraction (use refine) or
+    # mixed (use both). Lets non-technical users skip the version arg.
+    if auto:
+        shape = schema.detect_task_shape(structured)
+        _eprint(f"🔎 task shape detected: {shape}")
+        if shape == "classification":
+            skip_refine, skip_dpo = True, False
+            _eprint("   → enabling DPO (classification: best for label-shaped output)")
+        elif shape == "extraction":
+            skip_refine, skip_dpo = False, True
+            _eprint("   → enabling refine (extraction: best for verbatim output)")
+        else:  # mixed
+            skip_refine, skip_dpo = False, False
+            _eprint("   → enabling refine + DPO (mixed: both behaviors needed)")
+        _eprint("")
     with open(output_dir / "curriculum_data.json", "w") as f:
         json.dump(curriculum_data, f, indent=2)
 
@@ -261,34 +277,21 @@ def run_data_prep(
         n_refined = sum(1 for p in refined if p.get("refined"))
         _eprint(f"✅ {len(refined)} refined ({n_refined} rewritten)\n")
 
-    # ── 6.7. Quality classifier — OPTIONAL ─────────────────────────────
-    if skip_quality_filter:
-        _eprint("⏭️  STEP 6.7: skip_quality_filter=True → keeping all refined")
-        high_quality = refined
-        score_dist = {}
-    else:
-        _eprint("=" * 60)
-        _eprint("STEP 6.7: ⭐ quality scoring (0-5)")
-        _eprint("=" * 60)
-        scored = quality.score_quality(teacher, teacher_tok, refined)
-        high_quality, score_dist = quality.filter_by_quality(scored, min_score=3)
-        _eprint(f"✅ {len(high_quality)} high-quality pairs (≥3/5)\n")
-
-    # ── 6.8. DPO data generation — OPTIONAL ────────────────────────────
+    # ── 6.7. DPO data generation — OPTIONAL ────────────────────────────
     if skip_dpo:
-        _eprint("⏭️  STEP 6.8: skip_dpo=True")
+        _eprint("⏭️  STEP 6.7: skip_dpo=True")
         dpo_triples = []
     else:
         _eprint("=" * 60)
-        _eprint("STEP 6.8: 🎯 DPO preference pair generation")
+        _eprint("STEP 6.7: 🎯 DPO preference pair generation")
         _eprint("=" * 60)
-        dpo_triples = dpo.generate_rejected_answers(teacher, teacher_tok, high_quality)
+        dpo_triples = dpo.generate_rejected_answers(teacher, teacher_tok, refined)
         _eprint(f"✅ {len(dpo_triples)} DPO preference triples\n")
 
     with open(output_dir / "training_data_v2.json", "w") as f:
         json.dump(curriculum_data, f, indent=2)
     with open(output_dir / "training_data_clean.json", "w") as f:
-        json.dump(high_quality, f, indent=2)
+        json.dump(refined, f, indent=2)
     with open(output_dir / "training_data_dpo.json", "w") as f:
         json.dump(dpo_triples, f, indent=2)
 
@@ -315,9 +318,7 @@ def run_data_prep(
         "dropped_hallucination": dropped_hallu,
         "after_grounding": len(grounded),
         "refined_pairs": n_refined,
-        "quality_score_distribution": score_dist,
-        "high_quality_pairs": len(high_quality),
-        "clean_pairs": len(high_quality),  # final training set
+        "clean_pairs": len(refined),  # final training set
         "dpo_triples": len(dpo_triples),
         "teacher_model": teacher_model_name,
         "data_prep_seconds": round(elapsed, 1),
@@ -490,16 +491,14 @@ def main():
     )
     parser.add_argument("--skip-refine", action="store_true",
                         help="skip multi-pass critique→rewrite refinement")
-    parser.add_argument("--skip-quality-filter", action="store_true",
-                        help="skip 0-5 quality scoring filter")
-    parser.add_argument("--skip-new-tasks", action="store_true",
-                        help="use only 8 original tasks (no paraphrase/yes_no/fact/correction)")
     parser.add_argument("--skip-dpo", action="store_true",
                         help="skip DPO preference pair generation")
     parser.add_argument("--no-dedup", action="store_true",
                         help="skip MinHash deduplication (use for short/templated docs like logs)")
-    parser.add_argument("--v3-mode", action="store_true",
-                        help="shortcut: enables --skip-refine --skip-quality-filter --skip-new-tasks --skip-dpo (= original v3 behavior)")
+    parser.add_argument("--auto", action="store_true",
+                        help="auto-detect task shape (classification vs extraction) "
+                             "after schema + extraction; pick refine, DPO, or both accordingly. "
+                             "Overrides --skip-refine and --skip-dpo.")
     parser.add_argument(
         "--lf-config",
         type=Path,
@@ -526,13 +525,6 @@ def main():
 
     args = parser.parse_args()
 
-    # --v3-mode shortcut → enables all skip flags
-    if args.v3_mode:
-        args.skip_refine = True
-        args.skip_quality_filter = True
-        args.skip_new_tasks = True
-        args.skip_dpo = True
-
     if args.train_only:
         if args.use_llamafactory:
             run_training_llamafactory(args.output, args.lf_config)
@@ -551,10 +543,9 @@ def main():
         extract_batch_size=args.extract_batch_size,
         qa_batch_size=args.qa_batch_size,
         skip_refine=args.skip_refine,
-        skip_quality_filter=args.skip_quality_filter,
-        skip_new_tasks=args.skip_new_tasks,
         skip_dpo=args.skip_dpo,
         skip_dedup=args.no_dedup,
+        auto=args.auto,
     )
 
     if args.train:

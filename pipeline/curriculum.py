@@ -360,13 +360,8 @@ def generate_curriculum(
     domain: str,
     *,
     on_progress: Callable[[str, int, int], None] | None = None,
-    include_new_tasks: bool = True,  # kept for back-compat with run.py CLI flag
 ) -> list[dict[str, str]]:
-    """Run the 6 universal tasks and return the combined training set.
-
-    `include_new_tasks` is preserved for run.py CLI compatibility but no longer
-    gates anything — every task here is universal and runs on every domain.
-    """
+    """Run the 6 universal tasks and return the combined training set."""
 
     def _emit(task_name: str, rows: list[dict[str, str]]) -> None:
         print(f"  [{task_name}] generated {len(rows)} examples", flush=True)

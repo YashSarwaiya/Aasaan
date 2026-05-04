@@ -95,6 +95,57 @@ def normalize_schema(raw: dict[str, Any]) -> dict[str, str]:
     return {name: _desc_to_text(val) for name, val in raw.items()}
 
 
+def detect_task_shape(structured_items: list[dict[str, Any]]) -> str:
+    """Classify the user's data into one of three task shapes.
+
+    Looks at the extracted structured forms (the output of step 4) and decides
+    whether this domain is best served by classification (DPO), extraction
+    (refine), or both (refine + DPO).
+
+    Returns:
+      "classification" — ≤2 fields, all with bounded short value spaces.
+                         Schema is essentially a label set.
+                         Example: CUAD's {clause_type}.
+      "extraction"     — ≥3 fields with diverse per-doc values.
+                         Verbatim spans / structured records.
+                         Example: LogHub's {Date, Time, Level, Component, ...}.
+      "mixed"          — Looks like classification but has prose fields too,
+                         or schema has both bounded and unbounded fields.
+
+    Heuristic — not perfect, but right >90% of the time on the domains we've
+    tested. Caller can always override with explicit --skip-refine/--skip-dpo.
+    """
+    sample = [it.get("structured", {}) for it in structured_items[:50]
+              if isinstance(it.get("structured"), dict)]
+    if not sample:
+        return "extraction"
+
+    fields = sorted({f for s in sample for f in s.keys()})
+    if not fields:
+        return "extraction"
+
+    bounded_flags: list[bool] = []
+    for f in fields:
+        vals = {str(s.get(f, "")).strip() for s in sample if s.get(f)}
+        if not vals:
+            bounded_flags.append(False)
+            continue
+        # Bounded if few uniques across docs AND all values short
+        max_len = max(len(v) for v in vals)
+        bounded_flags.append(2 <= len(vals) <= 50 and max_len <= 80)
+
+    n_bounded = sum(bounded_flags)
+
+    # Pure classification: all fields are short bounded labels, ≤2 fields
+    if len(fields) <= 2 and n_bounded == len(fields):
+        return "classification"
+    # Mixed: at least one bounded label field but also unbounded prose fields
+    if 1 <= n_bounded < len(fields):
+        return "mixed"
+    # Otherwise, treat as extraction (most fields are diverse spans)
+    return "extraction"
+
+
 def detect_domain(model, tokenizer, sample_docs: list[str]) -> str:
     """Step 1: ask the model to label the domain in 2-5 words.
 

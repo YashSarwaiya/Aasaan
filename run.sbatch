@@ -13,18 +13,20 @@
 #   sbatch run.sbatch <input-file> [<column>] [<num-docs>] [<version>]
 #
 # Versions:
-#   v3         — lean baseline (no refine, no quality, no DPO)
-#   v3-refine  — v3 + refine          (= v4)
-#   v3-quality — v3 + quality filter  (ablation: does quality filter help?)
-#   v3-dpo     — v3 + DPO             (ablation: does DPO help?)
-#   v4         — v3 + refine          (alias for v3-refine)
-#   v5         — everything on        (refine + quality + new_tasks + DPO)
-#   v6         — refine + new_tasks   (no quality, no DPO)
+#   auto       — detect task shape after extraction, route automatically
+#                (classification → DPO, extraction → refine, mixed → both).
+#                DEFAULT. Recommended for non-technical users.
+#   v3-refine  — refine alone. Best for extraction tasks (logs, forms,
+#                structured records — verbatim outputs).
+#   v3-dpo     — DPO alone. Best for classification tasks (clause types,
+#                intents, categories — short label outputs).
+#   v3-best    — refine + DPO together. Candidate universal default; use
+#                when you don't trust the auto-detect (mixed/unusual data).
 #
 # Examples:
-#   sbatch run.sbatch ./loghub_data/loghub_train.csv raw_log 200 v3
-#   sbatch run.sbatch ./loghub_data/loghub_train.csv raw_log 200 v3-quality
-#   sbatch run.sbatch ./loghub_data/loghub_train.csv raw_log 200 v3-dpo
+#   sbatch run.sbatch ./loghub_data/loghub_train.csv raw_log 200 auto
+#   sbatch run.sbatch ./loghub_data/loghub_train.csv raw_log 200 v3-refine
+#   sbatch run.sbatch ./cuad_data/cuad_train.csv clause_text 200 v3-dpo
 
 set -euo pipefail
 
@@ -40,17 +42,14 @@ export HF_HUB_CACHE=$HF_HOME
 INPUT="${1:?usage: sbatch run.sbatch <input-file> [<column>] [<num-docs>] [<version>]}"
 COLUMN="${2:-}"
 NUM="${3:-250}"
-VERSION="${4:-v4}"
+VERSION="${4:-auto}"
 
 case "$VERSION" in
-  v3)         EXTRA_FLAGS=(--v3-mode) ;;
-  v3-refine)  EXTRA_FLAGS=(--skip-quality-filter --skip-new-tasks --skip-dpo) ;;
-  v3-quality) EXTRA_FLAGS=(--skip-refine --skip-new-tasks --skip-dpo) ;;
-  v3-dpo)     EXTRA_FLAGS=(--skip-refine --skip-quality-filter --skip-new-tasks) ;;
-  v4)         EXTRA_FLAGS=(--skip-quality-filter --skip-new-tasks --skip-dpo) ;;
-  v5)         EXTRA_FLAGS=() ;;
-  v6)         EXTRA_FLAGS=(--skip-quality-filter --skip-dpo) ;;
-  *)          echo "unknown version: $VERSION (expected v3|v3-refine|v3-quality|v3-dpo|v4|v5|v6)" >&2; exit 1 ;;
+  auto)       EXTRA_FLAGS=(--auto) ;;
+  v3-refine)  EXTRA_FLAGS=(--skip-dpo) ;;
+  v3-dpo)     EXTRA_FLAGS=(--skip-refine) ;;
+  v3-best)    EXTRA_FLAGS=() ;;  # refine + DPO both on
+  *)          echo "unknown version: $VERSION (expected auto|v3-refine|v3-dpo|v3-best)" >&2; exit 1 ;;
 esac
 
 # LogHub (and any other short/templated input) benefits from disabling
