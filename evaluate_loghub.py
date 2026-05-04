@@ -35,23 +35,36 @@ from pipeline.llm import batch_ask, extract_json
 
 BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
-PARSE_PROMPT = """You are a log parser. Parse this log line into JSON.
+def build_parse_prompt(fields: list[str]) -> str:
+    """Build a domain-agnostic extraction prompt from the ground-truth field set.
 
-Output ONLY valid JSON with these fields if present (omit any not in the line):
-- Date, Time, Level, Component, Content, EventTemplate
+    Auto-derives which fields to ask for based on what the test set's ground
+    truths contain. Adds LogHub-specific guidance (verbatim extraction,
+    `<*>` placeholders) only when those fields are present.
+    """
+    field_list = ", ".join(fields)
+    rules = [
+        "Use the EXACT substring from the input. Do NOT reformat or paraphrase.",
+        "If a field is not in the input, omit it from the JSON.",
+        "No explanations, no markdown, no preamble. JSON only.",
+    ]
+    if "EventTemplate" in fields:
+        rules.insert(
+            1,
+            "For EventTemplate, replace variable parts (numbers, IDs, paths, blocks) with <*>.",
+        )
+    rules_str = "\n- ".join([""] + rules).strip()
 
-Rules:
-- Use the EXACT substring from the log. Do NOT reformat dates or paraphrase content.
-- For EventTemplate, replace variable parts (numbers, IDs, paths, blocks) with <*>.
-- No explanations, no markdown, no preamble. JSON only.
-
-Log line:
-{raw_log}
-
-JSON:"""
+    return (
+        "You are an extraction tool. Parse this input into JSON.\n\n"
+        f"Output ONLY valid JSON with these fields if present (omit any not in the input):\n"
+        f"- {field_list}\n\n"
+        f"Rules:\n- {rules_str}\n\n"
+        "Input:\n{raw_log}\n\nJSON:"
+    )
 
 
-# Fields the prompt does NOT ask for — skip them in scoring (they'd be 0% by construction)
+# Fields the prompt does NOT ask for — skip them in scoring
 SKIP_FIELDS = {"EventId"}
 
 
@@ -66,12 +79,8 @@ def fields_match(field: str, expected, actual, *, lenient: bool) -> bool:
     """Compare expected vs actual for a single field.
 
     Strict: full string equality after stripping.
-    Lenient: per-field tolerance for legitimate format variants
-      - Date: ignore leading zeros (CSV import stripped them from GT)
-      - Date / Time: substring containment in either direction
-      - Component / Content: substring containment in either direction
-      - EventTemplate: normalize placeholders + whitespace, case-insensitive
-      - Level: case-insensitive
+    Lenient: per-field tolerance, with a generic fallback that handles any
+    classification or extraction field (case-insensitive substring containment).
     """
     e = str(expected).strip()
     a = str(actual).strip()
@@ -81,27 +90,29 @@ def fields_match(field: str, expected, actual, *, lenient: bool) -> bool:
     if not lenient:
         return False
 
+    # LogHub-specific tolerances
     if field == "Date":
         if a.lstrip("0") == e.lstrip("0"):
-            return True
-        if a in e or e in a:
-            return True
-    if field == "Time":
-        if a in e or e in a:
-            return True
-    if field == "Component" or field == "Content":
-        if a and e and (a in e or e in a):
             return True
     if field == "EventTemplate":
         if _norm_template(a) == _norm_template(e):
             return True
-    if field == "Level":
-        if a.lower() == e.lower():
+
+    # Generic lenient fallback — works for ANY field (classification labels,
+    # extraction substrings, log timestamps, etc.). Case-insensitive substring
+    # containment in either direction.
+    if a and e:
+        a_lower = a.lower()
+        e_lower = e.lower()
+        if a_lower == e_lower:
             return True
+        if a_lower in e_lower or e_lower in a_lower:
+            return True
+
     return False
 
 
-def evaluate_model(model, tokenizer, test_entries: list[dict], batch_size: int) -> dict:
+def evaluate_model(model, tokenizer, test_entries: list[dict], batch_size: int, parse_prompt: str) -> dict:
     """Score model on test set. Returns BOTH strict and lenient metrics."""
     n = len(test_entries)
     json_valid = 0
@@ -114,7 +125,7 @@ def evaluate_model(model, tokenizer, test_entries: list[dict], batch_size: int) 
 
     for start in range(0, n, batch_size):
         batch = test_entries[start:start + batch_size]
-        prompts = [PARSE_PROMPT.format(raw_log=e["raw_log"]) for e in batch]
+        prompts = [parse_prompt.format(raw_log=e["raw_log"]) for e in batch]
         responses = batch_ask(model, tokenizer, prompts, max_tokens=300)
 
         for entry, raw_response in zip(batch, responses):
@@ -233,20 +244,37 @@ def main():
     if args.num and args.num < len(test):
         random.Random(args.seed).shuffle(test)
         test = test[:args.num]
-    print(f"📂 evaluating {len(test)} test logs from {args.test_json}", flush=True)
+    print(f"📂 evaluating {len(test)} test entries from {args.test_json}", flush=True)
 
-    # ── Load base + tokenizer (shared across all evals) ──────────────
-    print(f"\n🤖 loading base: {BASE_MODEL}", flush=True)
+    # ── Derive the field set from the test ground truth ──────────────
+    # Build the prompt around whichever fields the test set actually uses.
+    # This lets the same script handle LogHub, CUAD, CRM, anything.
+    field_counts: dict[str, int] = {}
+    for entry in test:
+        for field in entry.get("ground_truth", {}):
+            if field in SKIP_FIELDS:
+                continue
+            field_counts[field] = field_counts.get(field, 0) + 1
+    fields_to_extract = sorted(field_counts.keys())
+    parse_prompt = build_parse_prompt(fields_to_extract)
+    print(f"📋 fields to extract: {fields_to_extract}", flush=True)
+
+    # ── Tokenizer (shared across all evals) ──────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    base = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL, dtype=torch.bfloat16, device_map="auto",
-    )
-    base.eval()
-    print("✅ base loaded", flush=True)
+    def load_fresh_base():
+        """Load base from scratch. Used between adapter evals to avoid
+        peft stacking — PeftModel.from_pretrained mutates the base, so we
+        reload to guarantee clean weights for each adapter test."""
+        print(f"\n🤖 loading base: {BASE_MODEL}", flush=True)
+        m = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL, dtype=torch.bfloat16, device_map="auto",
+        )
+        m.eval()
+        return m
 
     results: dict[str, dict] = {}
 
@@ -254,15 +282,18 @@ def main():
     print("\n" + "=" * 60)
     print("EVAL: base Llama 3.1 8B (untrained)")
     print("=" * 60)
-    results["base"] = evaluate_model(base, tokenizer, test, args.batch_size)
+    base = load_fresh_base()
+    results["base"] = evaluate_model(base, tokenizer, test, args.batch_size, parse_prompt)
     print_summary("base", results["base"])
+    del base
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    # ── 2. Each adapter, hot-swapped onto the same base ──────────────
+    # ── 2. Each adapter on a freshly-loaded base ─────────────────────
     for adapter_path in args.adapters:
-        # adapter_path is like "output_v3_TIMESTAMP/adapter" — use parent name as label
-        label = adapter_path.parent.name.replace("output_", "")  # e.g. "v3_20260503..."
-        # Trim trailing timestamp for cleaner table
-        short = label.split("_")[0] if "_" in label else label  # "v3"
+        label = adapter_path.parent.name.replace("output_", "")
+        short = label.split("_")[0] if "_" in label else label
 
         print("\n" + "=" * 60)
         print(f"EVAL: trained adapter {short}  ({adapter_path})")
@@ -271,13 +302,14 @@ def main():
             print(f"  ⚠️  skipping — adapter not found: {adapter_path}")
             continue
 
+        # Reload base fresh for each adapter — prevents peft stacking
+        base = load_fresh_base()
         wrapped = PeftModel.from_pretrained(base, str(adapter_path))
         wrapped.eval()
-        results[short] = evaluate_model(wrapped, tokenizer, test, args.batch_size)
+        results[short] = evaluate_model(wrapped, tokenizer, test, args.batch_size, parse_prompt)
         print_summary(short, results[short])
 
-        # Unload adapter so the next iteration sees the bare base again
-        del wrapped
+        del wrapped, base
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
