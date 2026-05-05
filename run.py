@@ -407,11 +407,29 @@ def run_training_llamafactory(output_dir: Path, config_path: Path) -> dict:
     return metadata
 
 
-def run_training(output_dir: Path, epochs: int) -> dict:
+def _auto_epochs(n_pairs: int) -> int:
+    """Auto-scale epochs based on training set size.
+
+    Goal: keep total gradient updates roughly stable across data sizes so the
+    model isn't over-trained at scale. Empirically, 3 epochs at 1000 pairs
+    works (3000 updates). 3 epochs at 9000 pairs over-fit and JSON validity
+    collapsed (see ABLATION_RESULTS.md, scale section).
+    """
+    if n_pairs > 5000:
+        return 1
+    if n_pairs > 2000:
+        return 2
+    return 3
+
+
+def run_training(output_dir: Path, epochs: int | str) -> dict:
     """Phase 9: load training_data_clean.json from output_dir and run LoRA.
 
     Final adapter goes to <output_dir>/adapter/.
     Checkpoints to <output_dir>/checkpoints/checkpoint-N/ (saved every 50 steps).
+
+    `epochs` accepts an integer or the string "auto", which scales epochs
+    based on the size of training_data_clean.json.
     """
     clean_path = output_dir / "training_data_clean.json"
     if not clean_path.exists():
@@ -425,12 +443,19 @@ def run_training(output_dir: Path, epochs: int) -> dict:
     if len(clean) < 20:
         raise SystemExit(f"only {len(clean)} clean pairs — need at least 20")
 
+    if epochs == "auto":
+        chosen = _auto_epochs(len(clean))
+        _eprint(f"📐 auto epochs: {chosen} (training set has {len(clean)} pairs)")
+        epochs = chosen
+    else:
+        epochs = int(epochs)
+
     _eprint("\n🤖 Loading Llama 3.1 8B Instruct for fine-tuning...")
     model, tokenizer = llm.load_model("meta-llama/Llama-3.1-8B-Instruct")
     _eprint("✅ Model loaded\n")
 
     _eprint("=" * 60)
-    _eprint(f"STEP 7: 🚀 fine-tuning LoRA on {len(clean)} clean pairs")
+    _eprint(f"STEP 7: 🚀 fine-tuning LoRA on {len(clean)} clean pairs ({epochs} epochs)")
     _eprint("=" * 60)
 
     started = time.time()
@@ -484,7 +509,13 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="output directory")
     parser.add_argument("--extract-batch-size", type=int, default=8)
     parser.add_argument("--qa-batch-size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument(
+        "--epochs",
+        default="auto",
+        help="number of training epochs, or 'auto' (default) which scales by "
+             "training-set size: >5000 pairs → 1, >2000 → 2, else 3. Pass an "
+             "integer to override (e.g. --epochs 1).",
+    )
     parser.add_argument(
         "--use-llamafactory",
         action="store_true",
